@@ -42,7 +42,6 @@ pub const ExprNodeList = js_ast.ExprNodeList;
 pub const StmtNodeList = js_ast.StmtNodeList;
 pub const BindingNodeList = js_ast.BindingNodeList;
 const DeclaredSymbol = js_ast.DeclaredSymbol;
-const ComptimeStringMap = @import("./comptime_string_map.zig").ComptimeStringMap;
 const JSC = bun.JSC;
 const Index = @import("./ast/base.zig").Index;
 
@@ -824,7 +823,7 @@ pub const TypeScript = struct {
                 else => return null,
             }
         }
-        pub const IMap = ComptimeStringMap(Kind, .{
+        pub const IMap = std.StaticStringMap(Kind).initComptime(.{
             .{ "unique", .unique },
             .{ "abstract", .abstract },
             .{ "asserts", .asserts },
@@ -2338,7 +2337,7 @@ const AsyncPrefixExpression = enum(u2) {
     is_async,
     is_await,
 
-    const map = ComptimeStringMap(AsyncPrefixExpression, .{
+    const map = std.StaticStringMap(AsyncPrefixExpression).initComptime(.{
         .{ "yield", .is_yield },
         .{ "await", .is_await },
         .{ "async", .is_async },
@@ -10492,6 +10491,7 @@ fn NewParser_(
             // Remove any direct children from their parent
             const scope = p.current_scope;
             var children = scope.children;
+            defer scope.children = children;
 
             for (p.scopes_in_order.items[scope_index..]) |_child| {
                 const child = _child orelse continue;
@@ -10500,9 +10500,7 @@ fn NewParser_(
                     var i: usize = children.len - 1;
                     while (i >= 0) {
                         if (children.mut(i).* == child.scope) {
-                            var list = children.listManaged(p.allocator);
-                            _ = list.orderedRemove(i);
-                            children.update(list);
+                            _ = children.orderedRemove(i);
                             break;
                         }
                         i -= 1;
@@ -11442,7 +11440,11 @@ fn NewParser_(
                 if (p.lexer.token == .t_string_literal) {
                     value.name = p.lexer.toEString();
                 } else if (p.lexer.isIdentifierOrKeyword()) {
-                    value.name = E.String{ .data = p.lexer.identifier };
+                    const id = p.lexer.identifier;
+                    value.name = if (bun.strings.isAllASCII(id))
+                        .{ .data = id }
+                    else
+                        E.String.init(try bun.strings.toUTF16AllocForReal(p.allocator, id, false, false));
                     needs_symbol = true;
                 } else {
                     try p.lexer.expect(.t_identifier);
@@ -11450,7 +11452,6 @@ fn NewParser_(
                 try p.lexer.next();
 
                 // Identifiers can be referenced by other values
-
                 if (!opts.is_typescript_declare and needs_symbol) {
                     value.ref = try p.declareSymbol(.other, value.loc, try value.name.string(p.allocator));
                 }
@@ -12863,7 +12864,13 @@ fn NewParser_(
                                         if (opts.is_class and is_typescript_enabled and !opts.is_ts_abstract and strings.eqlComptime(raw, "abstract")) {
                                             opts.is_ts_abstract = true;
                                             const scope_index = p.scopes_in_order.items.len;
-                                            _ = try p.parseProperty(kind, opts, null);
+                                            if (try p.parseProperty(kind, opts, null)) |_prop| {
+                                                var prop = _prop;
+                                                if (prop.kind == .normal and prop.value == null and opts.ts_decorators.len > 0) {
+                                                    prop.kind = .abstract;
+                                                    return prop;
+                                                }
+                                            }
                                             p.discardScopesUpTo(scope_index);
                                             return null;
                                         }
@@ -12910,6 +12917,13 @@ fn NewParser_(
                                 .class_static_block = block,
                             };
                         }
+                    }
+
+                    // Handle invalid identifiers in property names
+                    // https://github.com/oven-sh/bun/issues/12039
+                    if (p.lexer.token == .t_syntax_error) {
+                        p.log.addRangeErrorFmt(p.source, name_range, p.allocator, "Unexpected {}", .{bun.fmt.quote(name)}) catch bun.outOfMemory();
+                        return error.SyntaxError;
                     }
 
                     key = p.newExpr(E.String{ .data = name }, name_range.loc);
@@ -20037,7 +20051,10 @@ fn NewParser_(
 
                                         for (func.func.args, 0..) |arg, i| {
                                             for (arg.ts_decorators.ptr[0..arg.ts_decorators.len]) |arg_decorator| {
-                                                var decorators = if (is_constructor) class.ts_decorators.listManaged(p.allocator) else prop.ts_decorators.listManaged(p.allocator);
+                                                var decorators = if (is_constructor)
+                                                    class.ts_decorators.listManaged(p.allocator)
+                                                else
+                                                    prop.ts_decorators.listManaged(p.allocator);
                                                 const args = p.allocator.alloc(Expr, 2) catch unreachable;
                                                 args[0] = p.newExpr(E.Number{ .value = @as(f64, @floatFromInt(i)) }, arg_decorator.loc);
                                                 args[1] = arg_decorator;
@@ -20200,7 +20217,7 @@ fn NewParser_(
 
                     class.properties = class_properties.items;
 
-                    if (instance_members.items.len > 0 or class.extends != null) {
+                    if (instance_members.items.len > 0) {
                         if (constructor_function == null) {
                             var properties = ListManaged(Property).fromOwnedSlice(p.allocator, class.properties);
                             var constructor_stmts = ListManaged(Stmt).init(p.allocator);

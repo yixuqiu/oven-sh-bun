@@ -6,6 +6,7 @@ import * as buffer from "node:buffer";
 import * as util from "node:util";
 import { resolve } from "node:path";
 import { tmpdirSync } from "harness";
+import * as stream from "node:stream";
 
 describe("zlib", () => {
   it("should be able to deflate and inflate", () => {
@@ -152,7 +153,7 @@ describe("zlib.brotli", () => {
   });
 
   it("fully works as a stream.Transform", async () => {
-    const x_dir = tmpdirSync("bun.test.");
+    const x_dir = tmpdirSync();
     const out_path_c = resolve(x_dir, "this.js.br");
     const out_path_d = resolve(x_dir, "this.js");
 
@@ -178,6 +179,82 @@ describe("zlib.brotli", () => {
       const expected = await Bun.file(import.meta.filename).text();
       const actual = await Bun.file(out_path_d).text();
       expect(actual).toEqual(expected);
+    }
+  });
+
+  it("streaming encode doesn't wait for entire input", async () => {
+    const createPRNG = seed => {
+      let state = seed ?? Math.floor(Math.random() * 0x7fffffff);
+      return () => (state = (1103515245 * state + 12345) % 0x80000000) / 0x7fffffff;
+    };
+    const readStream = new stream.Readable();
+    const brotliStream = zlib.createBrotliCompress();
+    const rand = createPRNG(1);
+    let all = [];
+
+    brotliStream.on("data", chunk => all.push(chunk.length));
+    brotliStream.on("end", () => expect(all).toEqual([11180, 13, 14, 13, 13, 13, 14]));
+
+    for (let i = 0; i < 50; i++) {
+      let buf = Buffer.alloc(1024 * 1024);
+      for (let j = 0; j < buf.length; j++) buf[j] = (rand() * 256) | 0;
+      readStream.push(buf);
+    }
+    readStream.push(null);
+    readStream.pipe(brotliStream);
+  }, 15_000);
+
+  it("should accept params", async () => {
+    const ZLIB = zlib.constants;
+    const inputString2 =
+      "ΩΩLorem ipsum dolor sit amet, consectetur adipiscing eli" +
+      "t. Morbi faucibus, purus at gravida dictum, libero arcu " +
+      "convallis lacus, in commodo libero metus eu nisi. Nullam" +
+      " commodo, neque nec porta placerat, nisi est fermentum a" +
+      "ugue, vitae gravida tellus sapien sit amet tellus. Aenea" +
+      "n non diam orci. Proin quis elit turpis. Suspendisse non" +
+      " diam ipsum. Suspendisse nec ullamcorper odio. Vestibulu" +
+      "m arcu mi, sodales non suscipit id, ultrices ut massa. S" +
+      "ed ac sem sit amet arcu malesuada fermentum. Nunc sed. ";
+    const compressedString2 =
+      "G/gBQBwHdky2aHV5KK9Snf05//1pPdmNw/7232fnIm1IB" +
+      "K1AA8RsN8OB8Nb7Lpgk3UWWUlzQXZyHQeBBbXMTQXC1j7" +
+      "wg3LJs9LqOGHRH2bj/a2iCTLLx8hBOyTqgoVuD1e+Qqdn" +
+      "f1rkUNyrWq6LtOhWgxP3QUwdhKGdZm3rJWaDDBV7+pDk1" +
+      "MIkrmjp4ma2xVi5MsgJScA3tP1I7mXeby6MELozrwoBQD" +
+      "mVTnEAicZNj4lkGqntJe2qSnGyeMmcFgraK94vCg/4iLu" +
+      "Tw5RhKhnVY++dZ6niUBmRqIutsjf5TzwF5iAg8a9UkjF5" +
+      "2eZ0tB2vo6v8SqVfNMkBmmhxr0NT9LkYF69aEjlYzj7IE" +
+      "KmEUQf1HBogRYhFIt4ymRNEgHAIzOyNEsQM=";
+    const compressedString3 =
+      "G/gBAICqqqrq/3RluBvo4R73BQIgAOIuJirhIAAqKhqy+" +
+      "PHut0sMwMFYEIlJYoA7bQ5D/H/9v949xKAn2zB9eSC1QC" +
+      "Z1gX2ncEl1gKYeTdb9gCytgQ+PW/FLzXp3XjgdnaDCI+i" +
+      "pkzCVq+3C0lvCQcEN9v2ktTSxiDsv6Aa7mU/H0lvCYVKd" +
+      "kMbW1IHPXosM7GY+/cKWvxZsYRyPIpxFLEF1YWsqJAu/E" +
+      "ia72kD9aLnw1CLBI+ipk1CyVieSjspGqh0LVZUYBt5kC2" +
+      "1s35hKBg/Wga9w3fhrTUdQQVAdR3Pgu/PInpopugl2ooZ" +
+      "SH9vC6LXI2ONIwKf6wI9k6d2rDY4ocKYX0ictSSMmx+xk" +
+      "PVrQeaFXhbIkumCUSQPfMkGMFHNzQg2mPy3JpklwIIEc+" +
+      "OzNSJkD";
+
+    {
+      const compressed = await util.promisify(zlib.brotliCompress)(inputString2, {
+        params: {
+          [ZLIB.BROTLI_PARAM_MODE]: ZLIB.BROTLI_MODE_TEXT,
+          [ZLIB.BROTLI_PARAM_QUALITY]: 11,
+        },
+      });
+      expect(compressed.toString()).toEqual(Buffer.from(compressedString2, "base64").toString());
+    }
+    {
+      const compressed = await util.promisify(zlib.brotliCompress)(inputString2, {
+        params: {
+          [ZLIB.BROTLI_PARAM_MODE]: ZLIB.BROTLI_MODE_TEXT,
+          [ZLIB.BROTLI_PARAM_QUALITY]: 2,
+        },
+      });
+      expect(compressed.toString()).toEqual(Buffer.from(compressedString3, "base64").toString());
     }
   });
 });

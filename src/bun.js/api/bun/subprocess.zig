@@ -279,7 +279,7 @@ pub const Subprocess = struct {
     }
 
     pub fn updateHasPendingActivity(this: *Subprocess) void {
-        @fence(.SeqCst);
+        @fence(.seq_cst);
         if (comptime Environment.isDebug) {
             log("updateHasPendingActivity() {any} -> {any}", .{
                 this.has_pending_activity.raw,
@@ -288,7 +288,7 @@ pub const Subprocess = struct {
         }
         this.has_pending_activity.store(
             this.hasPendingActivityNonThreadsafe(),
-            .Monotonic,
+            .monotonic,
         );
     }
 
@@ -342,8 +342,8 @@ pub const Subprocess = struct {
     }
 
     pub fn hasPendingActivity(this: *Subprocess) callconv(.C) bool {
-        @fence(.Acquire);
-        return this.has_pending_activity.load(.Acquire);
+        @fence(.acquire);
+        return this.has_pending_activity.load(.acquire);
     }
 
     pub fn ref(this: *Subprocess) void {
@@ -443,6 +443,13 @@ pub const Subprocess = struct {
                     .capture => Output.panic("TODO: implement capture support in Stdio readable", .{}),
                 };
             }
+
+            if (comptime Environment.isPosix) {
+                if (stdio == .pipe) {
+                    _ = bun.sys.setNonblocking(result.?);
+                }
+            }
+
             return switch (stdio) {
                 .inherit => Readable{ .inherit = {} },
                 .ignore => Readable{ .ignore = {} },
@@ -735,7 +742,7 @@ pub const Subprocess = struct {
 
     pub fn disconnect(this: *Subprocess) void {
         const ipc_data = this.ipc_data orelse return;
-        ipc_data.socket.close(0, null);
+        ipc_data.socket.close(.normal);
         this.ipc_data = null;
     }
 
@@ -1175,7 +1182,7 @@ pub const Subprocess = struct {
         // When the stream has closed we need to be notified to prevent a use-after-free
         // We can test for this use-after-free by enabling hot module reloading on a file and then saving it twice
         pub fn onClose(this: *Writable, _: ?bun.sys.Error) void {
-            const process = @fieldParentPtr(Subprocess, "stdin", this);
+            const process: *Subprocess = @fieldParentPtr("stdin", this);
 
             if (process.this_jsvalue != .zero) {
                 if (Subprocess.stdinGetCached(process.this_jsvalue)) |existing_value| {
@@ -1262,6 +1269,13 @@ pub const Subprocess = struct {
                     },
                 }
             }
+
+            if (comptime Environment.isPosix) {
+                if (stdio == .pipe) {
+                    _ = bun.sys.setNonblocking(result.?);
+                }
+            }
+
             switch (stdio) {
                 .dup2 => @panic("TODO dup2 stdio"),
                 .pipe => {
@@ -1341,7 +1355,7 @@ pub const Subprocess = struct {
         }
 
         pub fn finalize(this: *Writable) void {
-            const subprocess = @fieldParentPtr(Subprocess, "stdin", this);
+            const subprocess: *Subprocess = @fieldParentPtr("stdin", this);
             if (subprocess.this_jsvalue != .zero) {
                 if (JSC.Codegen.JSSubprocess.stdinGetCached(subprocess.this_jsvalue)) |existing_value| {
                     JSC.WebCore.FileSink.JSSink.setDestroyCallback(existing_value, 0);
@@ -1597,7 +1611,7 @@ pub const Subprocess = struct {
     ) callconv(.C) JSValue {
         if (this.process.signalCode()) |signal| {
             if (signal.name()) |name|
-                return JSC.ZigString.init(name).toValueGC(global)
+                return JSC.ZigString.init(name).toJS(global)
             else
                 return JSC.JSValue.jsNumber(@intFromEnum(signal));
         }
@@ -1714,7 +1728,7 @@ pub const Subprocess = struct {
                     defer arg0.deinit();
 
                     if (argv0 == null) {
-                        var path_buf: [bun.MAX_PATH_BYTES]u8 = undefined;
+                        var path_buf: bun.PathBuffer = undefined;
                         const resolved = Which.which(&path_buf, PATH, cwd, arg0.slice()) orelse {
                             globalThis.throwInvalidArguments("Executable not found in $PATH: \"{s}\"", .{arg0.slice()});
                             return .zero;
@@ -1724,7 +1738,7 @@ pub const Subprocess = struct {
                             return .zero;
                         };
                     } else {
-                        var path_buf: [bun.MAX_PATH_BYTES]u8 = undefined;
+                        var path_buf: bun.PathBuffer = undefined;
                         const resolved = Which.which(&path_buf, PATH, cwd, bun.sliceTo(argv0.?, 0)) orelse {
                             globalThis.throwInvalidArguments("Executable not found in $PATH: \"{s}\"", .{arg0.slice()});
                             return .zero;
@@ -2044,9 +2058,9 @@ pub const Subprocess = struct {
         var posix_ipc_info: if (Environment.isPosix) IPC.Socket else void = undefined;
         if (Environment.isPosix and !is_sync) {
             if (maybe_ipc_mode != null) {
-                posix_ipc_info = .{
+                posix_ipc_info = IPC.Socket.from(
                     // we initialize ext later in the function
-                    .socket = uws.us_socket_from_fd(
+                    uws.us_socket_from_fd(
                         jsc_vm.rareData().spawnIPCContext(jsc_vm),
                         @sizeOf(*Subprocess),
                         spawned.extra_pipes.items[0].cast(),
@@ -2056,7 +2070,7 @@ pub const Subprocess = struct {
                         globalThis.throw("failed to create socket pair", .{});
                         return .zero;
                     },
-                };
+                );
             }
         }
 
@@ -2117,8 +2131,7 @@ pub const Subprocess = struct {
 
         if (subprocess.ipc_data) |*ipc_data| {
             if (Environment.isPosix) {
-                const ptr = posix_ipc_info.ext(*Subprocess);
-                ptr.?.* = subprocess;
+                posix_ipc_info.ext(*Subprocess).* = subprocess;
             } else {
                 if (ipc_data.configureServer(
                     Subprocess,
@@ -2240,8 +2253,6 @@ pub const Subprocess = struct {
 
         return sync_value;
     }
-
-    const os = std.os;
 
     pub fn handleIPCMessage(
         this: *Subprocess,

@@ -489,7 +489,7 @@ pub const FSWatcher = struct {
     pub fn initJS(this: *FSWatcher, listener: JSC.JSValue) void {
         if (this.persistent) {
             this.poll_ref.ref(this.ctx);
-            _ = this.pending_activity_count.fetchAdd(1, .Monotonic);
+            _ = this.pending_activity_count.fetchAdd(1, .monotonic);
         }
 
         const js_this = FSWatcher.toJS(this, this.globalThis);
@@ -523,7 +523,7 @@ pub const FSWatcher = struct {
 
     pub fn emitAbort(this: *FSWatcher, err: JSC.JSValue) void {
         if (this.closed) return;
-        _ = this.pending_activity_count.fetchAdd(1, .Monotonic);
+        _ = this.pending_activity_count.fetchAdd(1, .monotonic);
         defer this.close();
         defer this.unrefTask();
 
@@ -584,7 +584,7 @@ pub const FSWatcher = struct {
             if (this.encoding == .buffer)
                 filename = JSC.ArrayBuffer.createBuffer(globalObject, file_name)
             else if (this.encoding == .utf8) {
-                filename = JSC.ZigString.fromUTF8(file_name).toValueGC(globalObject);
+                filename = JSC.ZigString.fromUTF8(file_name).toJS(globalObject);
             } else {
                 // convert to desired encoding
                 filename = Encoder.toStringAtRuntime(file_name.ptr, file_name.len, globalObject, this.encoding);
@@ -606,7 +606,7 @@ pub const FSWatcher = struct {
         );
 
         if (err.toError()) |value| {
-            JSC.VirtualMachine.get().onError(globalObject, value);
+            _ = JSC.VirtualMachine.get().uncaughtException(globalObject, value, false);
         }
     }
 
@@ -632,28 +632,25 @@ pub const FSWatcher = struct {
 
     // this can be called from Watcher Thread or JS Context Thread
     pub fn refTask(this: *FSWatcher) bool {
-        {
-            @fence(.Acquire);
-            this.mutex.lock();
-            defer this.mutex.unlock();
-            if (this.closed) return false;
-            _ = this.pending_activity_count.fetchAdd(1, .Monotonic);
-        }
+        @fence(.acquire);
+        this.mutex.lock();
+        defer this.mutex.unlock();
+        if (this.closed) return false;
+        _ = this.pending_activity_count.fetchAdd(1, .monotonic);
 
         return true;
     }
 
     pub fn hasPendingActivity(this: *FSWatcher) callconv(.C) bool {
-        @fence(.Acquire);
-        return this.pending_activity_count.load(.Acquire) > 0;
+        @fence(.acquire);
+        return this.pending_activity_count.load(.acquire) > 0;
     }
 
     pub fn unrefTask(this: *FSWatcher) void {
         this.mutex.lock();
         defer this.mutex.unlock();
-
         // JSC eventually will free it
-        _ = this.pending_activity_count.fetchSub(1, .Monotonic);
+        _ = this.pending_activity_count.fetchSub(1, .monotonic);
     }
 
     pub fn close(this: *FSWatcher) void {
@@ -725,7 +722,7 @@ pub const FSWatcher = struct {
         };
         buf[cwd.len] = std.fs.path.sep;
 
-        var joined_buf: [bun.MAX_PATH_BYTES + 1]u8 = undefined;
+        var joined_buf: bun.PathBuffer = undefined;
         const file_path = Path.joinAbsStringBuf(
             buf[0 .. cwd.len + 1],
             &joined_buf,
