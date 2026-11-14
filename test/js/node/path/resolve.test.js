@@ -1,10 +1,10 @@
-import { test, describe } from "bun:test";
+import { describe, expect, test } from "bun:test";
+import { bunEnv, bunExe, isWindows, tempDir } from "harness";
 import assert from "node:assert";
+import fs from "node:fs";
 // import child from "node:child_process";
 import path from "node:path";
 // import fixtures from "./common/fixtures.js";
-
-const isWindows = process.platform === "win32";
 
 describe("path.resolve", () => {
   test("general", () => {
@@ -93,5 +93,141 @@ describe("path.resolve", () => {
     //     process.cwd = cwd;
     //   }
     // }
+  });
+
+  test("UNC path before drive-relative path does not corrupt resolvedDevice", () => {
+    // Parsing the UNC root reused the buffer backing the already-resolved `C:`
+    // device, which corrupted it from `C:` to `\\`. The UNC arg is on a
+    // different device so it should be ignored entirely.
+    //
+    // With the corruption, the `C:/base` arg is wrongly skipped because its
+    // device no longer matches, and the i=-1 cwd fallback produces garbage (on
+    // Windows it panicked reading uninitialized memory).
+    expect(path.win32.resolve("C:/base", "//server/share", "C:relative")).toBe("C:\\base\\relative");
+    expect(path.win32.resolve("C:/base", "//a/b", "//c/d", "C:foo")).toBe("C:\\base\\foo");
+    // These depend on cwd / =C: env on the right-hand side, so just check that
+    // the UNC arg is a no-op.
+    expect(path.win32.resolve("//server/share", "C:relative")).toBe(path.win32.resolve("C:relative"));
+    expect(path.win32.resolve("//server/share", "C:")).toBe(path.win32.resolve("C:"));
+    expect(path.win32.resolve("//a/b", "//c/d", "C:foo")).toBe(path.win32.resolve("C:foo"));
+  });
+
+  // Drive-relative paths ("C:foo") resolve against the per-drive cwd in `=C:`.
+  // Spawn a child with a known `=C:` so the expected output is deterministic.
+  test.skipIf(!isWindows)("win32 drive-relative input resolves against the per-drive cwd (=X: env var)", async () => {
+    const script = `const p = require("path");
+      console.log(JSON.stringify([
+        p.resolve("C:foo"),
+        p.resolve("C:"),
+        p.resolve("C:", "foo"),
+        p.resolve("C:foo/bar"),
+        p.resolve("c:foo"),
+        p.win32.resolve("C:foo"),
+        p.toNamespacedPath("C:foo"),
+      ]));`;
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "-e", script],
+      env: { ...bunEnv, "=C:": "C:\\known\\dir" },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect({ stdout: JSON.parse(stdout.trim()), stderr, exitCode }).toEqual({
+      stdout: [
+        "C:\\known\\dir\\foo",
+        "C:\\known\\dir",
+        "C:\\known\\dir\\foo",
+        "C:\\known\\dir\\foo\\bar",
+        "c:\\known\\dir\\foo",
+        "C:\\known\\dir\\foo",
+        "\\\\?\\C:\\known\\dir\\foo",
+      ],
+      stderr: "",
+      exitCode: 0,
+    });
+  });
+
+  test.skipIf(isWindows)(
+    "win32 drive-relative input resolves when the working directory is the filesystem root",
+    async () => {
+      const script = `const p = require("path");
+      console.log(JSON.stringify([
+        p.win32.resolve("C:foo"),
+        p.win32.resolve("C:"),
+      ]));`;
+      await using proc = Bun.spawn({
+        cmd: [bunExe(), "-e", script],
+        env: bunEnv,
+        cwd: "/",
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      expect(stdout.trim()).toBe(JSON.stringify(["C:\\foo", "C:\\"]));
+      expect(exitCode).toBe(0);
+    },
+  );
+
+  test.skipIf(!isWindows)("win32 drive-relative input on another drive resolves against that drive's root", () => {
+    const drive = process.cwd()[0].toUpperCase() === "Z" ? "Y:" : "Z:";
+    expect(path.resolve(drive + "foo")).toBe(drive + "\\foo");
+    expect(path.resolve(drive + "a", "b")).toBe(drive + "\\a\\b");
+  });
+
+  test("undefined argument are ignored if absolute path comes first (reverse loop through args)", () => {
+    expect(() => {
+      return path.posix.resolve(undefined, "hi");
+    }).toThrow('The "paths[0]" property must be of type string, got undefined');
+    expect(() => {
+      return path.posix.resolve(undefined, "/hi");
+    }).not.toThrow();
+  });
+
+  test("very long paths", () => {
+    // Regression test: buffer overflow with very long paths
+    // This used to panic because the buffer didn't account for the null terminator
+    for (const len of [4096, 10000, 50000, 98340, 100000]) {
+      // Use platform-specific absolute path prefix
+      const prefix = isWindows ? "C:\\" : "/";
+      const longPath = prefix + "a".repeat(len);
+      const result = path.resolve(longPath);
+      // Should return an absolute path with the repeated 'a' characters
+      assert.ok(result.includes("a"));
+      assert.ok(path.isAbsolute(result));
+      // Length should be prefix length + repeated characters
+      assert.strictEqual(result.length, prefix.length + len);
+    }
+
+    // Test with multiple paths that concatenate to a very long path
+    const longSegment = "b".repeat(50000);
+    const pathPrefix = isWindows ? "C:\\" : "/";
+    const result = path.resolve(pathPrefix, longSegment, "c");
+    assert.ok(result.includes("b"));
+    // On Windows, paths use backslash; on POSIX, forward slash
+    const expectedEnding = isWindows ? "\\c" : "/c";
+    assert.ok(result.endsWith(expectedEnding));
+  });
+
+  test.skipIf(isWindows)("a backslash at the end of the cwd is part of its name", async () => {
+    using dir = tempDir("resolve-backslash-cwd", { "e\\/z": "" });
+
+    await using proc = Bun.spawn({
+      cmd: [
+        bunExe(),
+        "-e",
+        `const path = require("node:path");
+         console.log(JSON.stringify([path.resolve("z"), path.resolve("."), path.relative("..", "z")]));`,
+      ],
+      env: bunEnv,
+      cwd: path.join(String(dir), "e\\"),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+
+    const cwd = fs.realpathSync(String(dir)) + "/e\\";
+    expect(stderr).toBe("");
+    expect(JSON.parse(stdout)).toEqual([cwd + "/z", cwd, "e\\/z"]);
+    expect(exitCode).toBe(0);
   });
 });

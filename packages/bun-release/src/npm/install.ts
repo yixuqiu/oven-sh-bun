@@ -1,10 +1,11 @@
-import { fetch } from "../fetch";
-import { spawn } from "../spawn";
-import { chmod, join, rename, rm, tmp, write } from "../fs";
+import { isAbsolute, relative } from "path";
 import { unzipSync } from "zlib";
-import type { Platform } from "../platform";
-import { os, arch, supportedPlatforms } from "../platform";
 import { debug, error } from "../console";
+import { fetch } from "../fetch";
+import { chmod, join, link, rename, rm, tmp, write } from "../fs";
+import type { Platform } from "../platform";
+import { abi, arch, os, supportedPlatforms } from "../platform";
+import { spawn } from "../spawn";
 
 declare const version: string;
 declare const module: string;
@@ -12,7 +13,7 @@ declare const owner: string;
 
 export async function importBun(): Promise<string> {
   if (!supportedPlatforms.length) {
-    throw new Error(`Unsupported platform: ${os} ${arch}`);
+    throw new Error(`Unsupported platform: ${os} ${arch} ${abi || ""}`);
   }
   for (const platform of supportedPlatforms) {
     try {
@@ -107,12 +108,16 @@ async function downloadBun(platform: Platform, dst: string): Promise<void> {
     const size = parseInt(str(offset + 124, 12), 8);
     offset += 512;
     if (!isNaN(size)) {
-      write(join(dst, name), buffer.subarray(offset, offset + size));
-      if (name === platform.exe) {
-        try {
-          chmod(join(dst, name), 0o755);
-        } catch (error) {
-          debug("chmod failed", error);
+      const entryPath = join(dst, name);
+      const entryName = relative(dst, entryPath);
+      if (entryName && !entryName.startsWith("..") && !isAbsolute(entryName)) {
+        write(entryPath, buffer.subarray(offset, offset + size));
+        if (name === platform.exe) {
+          try {
+            chmod(entryPath, 0o755);
+          } catch (error) {
+            debug("chmod failed", error);
+          }
         }
       }
       offset += (size + 511) & ~511;
@@ -121,9 +126,11 @@ async function downloadBun(platform: Platform, dst: string): Promise<void> {
 }
 
 export function optimizeBun(path: string): void {
-  const installScript = os === "win32" ? 'powershell -c "irm bun.sh/install.ps1 | iex"' : "curl -fsSL https://bun.sh/install | bash";
+  const installScript =
+    os === "win32" ? 'powershell -c "irm bun.sh/install.ps1 | iex"' : "curl -fsSL https://bun.com/install | bash";
   try {
     rename(path, join(__dirname, "bin", "bun.exe"));
+    link(join(__dirname, "bin", "bun.exe"), join(__dirname, "bin", "bunx.exe"));
     return;
   } catch (error) {
     debug("optimizeBun failed", error);

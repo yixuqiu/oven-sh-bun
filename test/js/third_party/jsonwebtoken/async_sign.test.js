@@ -1,7 +1,7 @@
-import jwt from "jsonwebtoken";
-import { expect, describe, it } from "bun:test";
-import jws from "jws";
+import { describe, expect, it } from "bun:test";
 import { generateKeyPairSync } from "crypto";
+import jwt from "jsonwebtoken";
+import jws from "jws";
 var PS_SUPPORTED = true;
 
 describe("signing a token asynchronously", function () {
@@ -9,9 +9,11 @@ describe("signing a token asynchronously", function () {
     var secret = "shhhhhh";
 
     it("should return the same result as singing synchronously", function (done) {
-      jwt.sign({ foo: "bar" }, secret, { algorithm: "HS256" }, function (err, asyncToken) {
+      // Without an iat each sign() stamps the current second, and the two calls can land in different seconds.
+      var payload = { foo: "bar", iat: 1437018582 };
+      jwt.sign(payload, secret, { algorithm: "HS256" }, function (err, asyncToken) {
         if (err) return done(err);
-        var syncToken = jwt.sign({ foo: "bar" }, secret, { algorithm: "HS256" });
+        var syncToken = jwt.sign(payload, secret, { algorithm: "HS256" });
         expect(typeof asyncToken).toBe("string");
         expect(asyncToken.split(".")).toHaveLength(3);
         expect(asyncToken).toEqual(syncToken);

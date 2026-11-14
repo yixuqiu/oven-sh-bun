@@ -1,6 +1,6 @@
 # Bun
 
-Bun is a fast all-in-one JavaScript runtime. https://bun.sh
+Bun is a fast all-in-one JavaScript runtime. https://bun.com
 
 ### Install
 
@@ -18,14 +18,14 @@ bun upgrade
 
 - [macOS, arm64 (Apple Silicon)](https://www.npmjs.com/package/@oven/bun-darwin-aarch64)
 - [macOS, x64](https://www.npmjs.com/package/@oven/bun-darwin-x64)
-- [macOS, x64 (without AVX2 instructions)](https://www.npmjs.com/package/@oven/bun-darwin-x64-baseline)
 - [Linux, arm64](https://www.npmjs.com/package/@oven/bun-linux-aarch64)
 - [Linux, x64](https://www.npmjs.com/package/@oven/bun-linux-x64)
-- [Linux, x64 (without AVX2 instructions)](https://www.npmjs.com/package/@oven/bun-linux-x64-baseline)
-- [Windows (using Windows Subsystem for Linux, aka. "WSL")](https://relatablecode.com/how-to-set-up-bun-on-a-windows-machine)
+- [Windows, x64](https://www.npmjs.com/package/@oven/bun-windows-x64)
+- [Windows, arm64](https://www.npmjs.com/package/@oven/bun-windows-aarch64)
+
+The x64 binary targets Nehalem (SSE4.2) and dispatches AVX2/AVX-512 at runtime. The `@oven/bun-*-x64-baseline` packages are published as aliases of the same binary for backward compatibility.
 
 ### Future Platforms
 
-- [Windows](https://github.com/oven-sh/bun/issues/43)
 - Unix-like variants such as FreeBSD, OpenBSD, etc.
 - Android and iOS

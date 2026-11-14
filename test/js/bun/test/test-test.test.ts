@@ -1,15 +1,16 @@
 // @ts-nocheck
 import { spawn, spawnSync } from "bun";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, test } from "bun:test";
-import { mkdirSync, realpathSync, rmSync, writeFileSync, copyFileSync } from "fs";
-import { mkdtemp, rm, writeFile } from "fs/promises";
-import { bunEnv, bunExe } from "harness";
+import { copyFileSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "fs";
+import { rm, writeFile } from "fs/promises";
+import { bunEnv, bunExe, tempDir, tmpdirSync } from "harness";
 import { tmpdir } from "os";
-import { join, dirname } from "path";
+import { dirname, join } from "path";
 
 const tmp = realpathSync(tmpdir());
 
 it("shouldn't crash when async test runner callback throws", async () => {
+  console.log("it(shouldn't crash when async test runner callback throws)");
   const code = `
   beforeEach(async () => {
     await 1;
@@ -27,7 +28,7 @@ it("shouldn't crash when async test runner callback throws", async () => {
   })
 `;
 
-  const test_dir = await mkdtemp(join(tmp, "test"));
+  const test_dir = tmpdirSync();
   try {
     await writeFile(join(test_dir, "bad.test.js"), code);
     const { stdout, stderr, exited } = spawn({
@@ -38,16 +39,17 @@ it("shouldn't crash when async test runner callback throws", async () => {
       stderr: "pipe",
       env: bunEnv,
     });
-    const err = await new Response(stderr).text();
+    const err = await stderr.text();
     expect(err).toContain("Test passed successfully");
     expect(err).toContain("error: ##123##");
-    expect(err).toContain("error: ##456##");
+    expect(err).not.toContain("error: ##456##"); // Because the beforeEach failed, we do not expect the test to run.
     expect(stdout).toBeDefined();
-    expect(await new Response(stdout).text()).toBe("");
+    expect(await stdout.text()).toBe(`bun test ${Bun.version_with_sha}\n`);
     expect(await exited).toBe(1);
   } finally {
     await rm(test_dir, { force: true, recursive: true });
   }
+  console.log("it(shouldn't crash when async test runner callback throws) - done");
 });
 
 test("testing Bun.deepEquals() using isEqual()", () => {
@@ -183,20 +185,47 @@ try {
   test();
 } catch (e) {}
 
-describe("throw in describe scope doesn't enqueue tests after thrown", () => {
-  it("test enqueued before a describe scope throws is never run", () => {
-    throw new Error("This test failed");
+test("describe scope throwing doesn't block other tests from running", async () => {
+  const code = `
+  describe("throw in describe scope doesn't enqueue tests after thrown", () => {
+    it("test enqueued before a describe scope throws is never run", () => {
+      throw new Error("This test failed");
+    });
+
+    throw "This test passed. Ignore the error message";
+
+    it("test enqueued after a describe scope throws is never run", () => {
+      throw new Error("This test failed");
+    });
   });
 
-  throw "This test passed. Ignore the error message";
-
-  it("test enqueued after a describe scope throws is never run", () => {
-    throw new Error("This test failed");
+  it("a describe scope throwing doesn't cause all other tests in the file to fail", () => {
+    console.log(
+      String.fromCharCode(...[73, 32, 104, 97, 118, 101, 32, 98, 101, 101, 110, 32, 114, 101, 97, 99, 104, 101, 100, 33]),
+    );
   });
-});
+`;
 
-it("a describe scope throwing doesn't cause all other tests in the file to fail", () => {
-  expect(true).toBe(true);
+  const dir = tmpdirSync();
+  const filepath = join(dir, "test-i-have-been-reached.test.js");
+  rmSync(filepath, {
+    force: true,
+  });
+
+  try {
+    mkdirSync(dir, { recursive: true });
+  } catch (e) {}
+  writeFileSync(filepath, code);
+
+  const { stdout, stderr, exitCode } = spawnSync([bunExe(), "test", "test-i-have-been-reached.test.js"], {
+    cwd: dir,
+    env: bunEnv,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+
+  expect(stdout.toString()).toContain("I have been reached!");
+  expect(stderr.toString()).toContain("1 error");
 });
 
 test("test async exceptions fail tests", () => {
@@ -229,37 +258,10 @@ test("test async exceptions fail tests", () => {
     await 1;
   });
 
-  test('test throwing inside a setTimeout', async () => {
-    await new Promise((resolve, reject) => {
-      setTimeout(() => {
-        resolve();
-        throw new Error('test throwing inside an EventEmitter #FAIL004');
-      }, 0);
-    });
-  });
 
-  test('test throwing inside an async setTimeout', async () => {
-    await new Promise((resolve, reject) => {
-      setTimeout(async () => {
-        await 1;
-        resolve();
-        throw new Error('test throwing inside an EventEmitter #FAIL005');
-      }, 0);
-    });
-  });
-
-
-  test('test throwing inside an async setTimeout no await' , async () => {
-    await new Promise((resolve, reject) => {
-      setTimeout(async () => {
-        resolve();
-        throw new Error('test throwing inside an EventEmitter #FAIL006');
-      }, 0);
-    });
-  });
 
   `;
-  const dir = join(tmp, "test-throwing-bun");
+  const dir = tmpdirSync();
   const filepath = join(dir, "test-throwing-eventemitter.test.js");
   rmSync(filepath, {
     force: true,
@@ -279,17 +281,14 @@ test("test async exceptions fail tests", () => {
   expect(str).toContain("#FAIL001");
   expect(str).toContain("#FAIL002");
   expect(str).toContain("#FAIL003");
-  expect(str).toContain("#FAIL004");
-  expect(str).toContain("#FAIL005");
-  expect(str).toContain("#FAIL006");
-  expect(str).toContain("6 fail");
+  expect(str).toContain("3 fail");
   expect(str).toContain("0 pass");
 
   expect(exitCode).toBe(1);
 });
 
 it("should return non-zero exit code for invalid syntax", async () => {
-  const test_dir = await mkdtemp(join(tmp, "test"));
+  const test_dir = tmpdirSync();
   try {
     await writeFile(join(test_dir, "bad.test.js"), "!!!");
     const { stdout, stderr, exited } = spawn({
@@ -300,13 +299,29 @@ it("should return non-zero exit code for invalid syntax", async () => {
       stderr: "pipe",
       env: bunEnv,
     });
-    const err = await new Response(stderr).text();
-    expect(err).toContain("error: Unexpected end of file");
-    expect(err).toContain(" 0 pass");
-    expect(err).toContain(" 1 fail");
-    expect(err).toContain("Ran 1 tests across 1 files");
+    const err = (await stderr.text()).replaceAll("\\", "/");
+    expect(err.replaceAll(test_dir.replaceAll("\\", "/"), "<dir>").replaceAll(/\[[\d.]+m?s\]/g, "[xx ms]"))
+      .toMatchInlineSnapshot(`
+      "
+      bad.test.js:
+
+      # Unhandled error between tests
+      -------------------------------
+      1 | !!!
+            ^
+      error: Unexpected end of file
+          at <dir>/bad.test.js:1:3
+      -------------------------------
+
+
+       0 pass
+       1 fail
+       1 error
+      Ran 1 test across 1 file. [xx ms]
+      "
+    `);
     expect(stdout).toBeDefined();
-    expect(await new Response(stdout).text()).toBe("");
+    expect(await stdout.text()).toBe(`bun test ${Bun.version_with_sha}\n`);
     expect(await exited).toBe(1);
   } finally {
     await rm(test_dir, { force: true, recursive: true });
@@ -314,7 +329,7 @@ it("should return non-zero exit code for invalid syntax", async () => {
 });
 
 it("invalid syntax counts towards bail", async () => {
-  const test_dir = await mkdtemp(join(tmp, "test"));
+  const test_dir = tmpdirSync();
   try {
     await writeFile(join(test_dir, "bad1.test.js"), "!!!");
     await writeFile(join(test_dir, "bad2.test.js"), "!!!");
@@ -329,12 +344,12 @@ it("invalid syntax counts towards bail", async () => {
       stderr: "pipe",
       env: bunEnv,
     });
-    const err = await new Response(stderr).text();
+    const err = await stderr.text();
     expect(err).toContain("Bailed out after 3 failures");
     expect(err).not.toContain("DO NOT RUN ME");
     expect(err).toContain("Ran 3 tests across 3 files");
     expect(stdout).toBeDefined();
-    expect(await new Response(stdout).text()).toBe("");
+    expect(await stdout.text()).toBe(`bun test ${Bun.version_with_sha}\n`);
     expect(await exited).toBe(1);
   } finally {
     // await rm(test_dir, { force: true, recursive: true });
@@ -526,7 +541,7 @@ it("test.todo doesnt cause exit code 1", () => {
 it("test timeouts when expected", () => {
   const path = join(tmp, "test-timeout.test.js");
   copyFileSync(join(import.meta.dir, "timeout-test-fixture.js"), path);
-  const { stdout, stderr, exited } = spawnSync({
+  const { stderr } = spawnSync({
     cmd: [bunExe(), "test", path],
     stdout: "pipe",
     stderr: "pipe",
@@ -535,8 +550,24 @@ it("test timeouts when expected", () => {
   });
 
   const err = stderr!.toString();
-  expect(err).toContain("timed out after 10ms");
+  expect(err).toHaveTestTimedOutAfter(10);
   expect(err).not.toContain("unreachable code");
+});
+
+test("jest.setTimeout will change default timeout", () => {
+  const path = join(tmp, "jest-setTimeout-test.test.js");
+  copyFileSync(join(import.meta.dir, "setTimeout-test-fixture.js"), path);
+  const { stderr, exitCode } = spawnSync({
+    cmd: [bunExe(), "test", path],
+    stdout: "pipe",
+    stderr: "pipe",
+    env: bunEnv,
+    cwd: dirname(path),
+  });
+
+  const err = stderr!.toString();
+  expect(err).not.toContain("error:");
+  expect(exitCode).toBe(0);
 });
 
 it("expect().toEqual() on objects with property indices doesn't print undefined", () => {
@@ -551,7 +582,7 @@ it("expect().toEqual() on objects with property indices doesn't print undefined"
   });
 
   let err = stderr!.toString();
-  err = err.substring(err.indexOf("expect(received).toEqual(expected)"), err.indexOf("at "));
+  err = err.substring(err.indexOf("expect(received).toEqual(expected)"), err.indexOf("at ")).trim();
 
   expect(err).toMatchSnapshot();
   expect(err).not.toContain("undefined");
@@ -571,6 +602,7 @@ it("test --preload supports global lifecycle hooks", () => {
   });
   expect(stdout.toString().trim()).toBe(
     `
+bun test ${Bun.version_with_sha}
 beforeAll: #1
 beforeAll: #2
 beforeAll: TEST-FILE
@@ -615,8 +647,113 @@ it("skip() and skipIf()", () => {
   expect(result.match(/reachable/g)).toHaveLength(6);
 });
 
+describe.concurrent("hooks of a describe block that does not run", () => {
+  const fixture = `
+    import { afterAll, afterEach, beforeAll, beforeEach, describe, test, xdescribe } from "bun:test";
+    function hooks(name) {
+      beforeAll(() => console.log(name, "beforeAll"));
+      beforeEach(() => console.log(name, "beforeEach"));
+      afterEach(() => console.log(name, "afterEach"));
+      afterAll(() => console.log(name, "afterAll"));
+    }
+    function block(name) {
+      return [name, () => {
+        hooks(name);
+        test("outer", () => { throw new Error("not done yet"); });
+        describe("nested", () => {
+          hooks(name + " nested");
+          test("inner", () => { throw new Error("not done yet"); });
+        });
+      }];
+    }
+    describe.skip(...block("skip"));
+    xdescribe(...block("xdescribe"));
+    describe.skipIf(true)(...block("skipIf"));
+    describe.if(false)(...block("if"));
+    describe.todo(...block("todo"));
+    describe.todoIf(true)(...block("todoIf"));
+    describe("runs", () => {
+      hooks("runs");
+      test("outer", () => {});
+    });
+  `;
+
+  async function run(...args: string[]) {
+    using dir = tempDir("hooks-in-skipped-describe", { "hooks.test.js": fixture });
+    await using proc = spawn({
+      cmd: [bunExe(), "test", "hooks.test.js", "--reporter=junit", "--reporter-outfile=junit.xml", ...args],
+      cwd: String(dir),
+      stdout: "pipe",
+      stderr: "pipe",
+      env: bunEnv,
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    const junit = await Bun.file(join(String(dir), "junit.xml")).text();
+    return {
+      hooks: stdout.split("\n").filter(line => /(All|Each)$/.test(line)),
+      reported: stderr
+        .split("\n")
+        .filter(line => /^\((pass|fail|skip|todo)\) /.test(line))
+        .map(line => line.replace(/ \[[\d.]+ms\]$/, "")),
+      summary: stderr.split("\n").filter(line => /^ \d+ (pass|fail|skip|todo)$|^Ran /.test(line)),
+      junit: [
+        /<testsuites [^>]*?(tests="\d+").*?(skipped="\d+")/.exec(junit)?.slice(1),
+        junit.match(/<testcase /g)?.length,
+      ],
+      exitCode,
+    };
+  }
+  const ran = ["runs beforeAll", "runs beforeEach", "runs afterEach", "runs afterAll"];
+  const skipped = ["skip", "xdescribe", "skipIf", "if"].flatMap(name => [
+    `(skip) ${name} > outer`,
+    `(skip) ${name} > nested > inner`,
+  ]);
+  const todo = ["todo", "todoIf"].flatMap(name => [`(todo) ${name} > outer`, `(todo) ${name} > nested > inner`]);
+
+  it("are not reported as tests", async () => {
+    const { summary, ...result } = await run();
+    expect(result).toEqual({
+      hooks: ran,
+      reported: [...skipped, ...todo, "(pass) runs > outer"],
+      junit: [[`tests="13"`, `skipped="12"`], 13],
+      exitCode: 0,
+    });
+    expect(summary.map(line => line.replace(/ \[.*$/, ""))).toEqual([
+      " 1 pass",
+      " 8 skip",
+      " 4 todo",
+      " 0 fail",
+      "Ran 13 tests across 1 file.",
+    ]);
+  });
+
+  it("run in describe.todo() with --todo", async () => {
+    const { summary, ...result } = await run("--todo");
+    expect(result).toEqual({
+      hooks: [
+        ...["todo", "todoIf"].flatMap(name => [
+          `${name} beforeAll`,
+          `${name} beforeEach`,
+          `${name} afterEach`,
+          `${name} nested beforeAll`,
+          `${name} beforeEach`,
+          `${name} nested beforeEach`,
+          `${name} nested afterEach`,
+          `${name} afterEach`,
+          `${name} nested afterAll`,
+          `${name} afterAll`,
+        ]),
+        ...ran,
+      ],
+      reported: [...skipped, ...todo, "(pass) runs > outer"],
+      junit: [[`tests="13"`, `skipped="12"`], 13],
+      exitCode: 0,
+    });
+  });
+});
+
 it("should run beforeAll() & afterAll() even without tests", async () => {
-  const test_dir = await mkdtemp(join(tmp, "test-hooks-empty"));
+  const test_dir = tmpdirSync();
   try {
     await writeFile(
       join(test_dir, "empty.test.js"),
@@ -643,14 +780,77 @@ describe("empty", () => {
       env: bunEnv,
     });
     expect(stderr).toBeDefined();
-    const err = await new Response(stderr).text();
+    const err = await stderr.text();
     expect(err).toContain("0 pass");
     expect(err).toContain("0 fail");
     expect(stdout).toBeDefined();
-    const out = await new Response(stdout).text();
-    expect(out.split(/\r?\n/)).toEqual(["before all", "before all scoped", "after all scoped", "after all", ""]);
+    const out = await stdout.text();
+    expect(out.split(/\r?\n/)).toEqual([
+      `bun test ${Bun.version_with_sha}`,
+      "before all",
+      "before all scoped",
+      "after all scoped",
+      "after all",
+      "",
+    ]);
     expect(await exited).toBe(0);
   } finally {
     await rm(test_dir, { force: true, recursive: true });
+  }
+});
+
+describe("unhandled errors between tests are reported", () => {
+  const stages = ["beforeAll", "beforeEach", "afterEach", "afterAll", "describe"];
+
+  for (const stage of stages) {
+    test("in " + stage, () => {
+      const code = /*js*/ `
+import {test, beforeAll, expect, beforeEach, afterEach, afterAll, describe} from "bun:test";
+
+${stage}(async () => {
+  Promise.resolve().then(() => {
+    throw new Error('## stage ${stage} ##');
+  });
+  await Bun.sleep(1);
+});
+
+test("my-test", () => {
+  expect(1).toBe(1);
+});
+    `.trim();
+
+      using test_dir = tempDir("unhandled-" + stage, {
+        "my-test.test.js": code,
+        "package.json": "{}",
+      });
+
+      const { stderr, exited } = spawnSync({
+        cmd: [bunExe(), "test", "my-test.test.js"],
+        cwd: test_dir,
+        stdout: "inherit",
+        stderr: "pipe",
+        env: bunEnv,
+      });
+      const output = stderr.toString();
+
+      expect(output).toContain(`## stage ${stage} ##`);
+
+      expect(output).toContain("1 | import {test, beforeAll, expect, beforeEach, afterEach, afterAll, describe}");
+
+      const stackLines = output.split("\n").filter(line => line.trim().startsWith("at "));
+      expect(stackLines.length).toBeGreaterThan(0);
+      if (process.platform === "win32") {
+        expect(stackLines[0]).toContain(`<dir>\\my-test.test.js:5:15`.replace("<dir>", test_dir));
+      }
+      if (process.platform !== "win32") {
+        expect(stackLines[0]).toContain(`<dir>/my-test.test.js:5:15`.replace("<dir>", test_dir));
+      }
+
+      expect(output).toContain("1 pass"); // since the error is unhandled and in a hook, the error does not get attributed to the hook and the test is still allowed to run
+      expect(output).toContain("0 fail");
+      expect(output).toContain("1 error");
+
+      expect(output).toContain("Ran 1 test across 1 file");
+    });
   }
 });

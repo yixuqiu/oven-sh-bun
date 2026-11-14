@@ -1,4 +1,4 @@
-import { test, describe, expect } from "bun:test";
+import { describe, expect, test } from "bun:test";
 const MAP_SIZE = 918 * 4;
 
 describe("toEqual on a large Map", () => {
@@ -13,7 +13,6 @@ describe("toEqual on a large Map", () => {
     class CustomMap extends Map {
       abc: number = 123;
 
-      // @ts-expect-error
       constructor(iterable) {
         // @ts-expect-error
         super(iterable);

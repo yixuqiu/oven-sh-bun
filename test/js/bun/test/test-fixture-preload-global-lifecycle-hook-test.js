@@ -1,4 +1,4 @@
-import { beforeAll, afterAll, afterEach, beforeEach, test, describe } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, test } from "bun:test";
 
 for (let suffix of ["TEST-FILE"]) {
   for (let fn of [
@@ -11,10 +11,6 @@ for (let suffix of ["TEST-FILE"]) {
   }
 }
 
-test("the top-level test", () => {
-  console.log("-- the top-level test --");
-});
-
 describe("one describe scope", () => {
   beforeAll(() => console.log("beforeAll: one describe scope"));
   afterAll(() => console.log("afterAll: one describe scope"));
@@ -24,4 +20,8 @@ describe("one describe scope", () => {
   test("inside one describe scope", () => {
     console.log("-- inside one describe scope --");
   });
+});
+
+test("the top-level test", () => {
+  console.log("-- the top-level test --");
 });

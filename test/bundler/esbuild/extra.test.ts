@@ -1,7 +1,5 @@
-import assert from "assert";
-import dedent from "dedent";
-import { itBundled, testForFile } from "../expectBundled";
-var { describe, test, expect } = testForFile(import.meta.path);
+import { describe } from "bun:test";
+import { itBundled } from "../expectBundled";
 
 // Tests ported from:
 // https://github.com/evanw/esbuild
@@ -165,8 +163,6 @@ describe("bundler", () => {
     run: true,
   });
   itBundled("extra/TypeofRequireESM", {
-    // we do not have require defined in target browser
-    todo: true,
     files: {
       "in.js": `check(typeof require)`,
       "runtime.js": `
@@ -434,7 +430,6 @@ describe("bundler", () => {
 
   // Use "eval" to access CommonJS variables
   itBundled("extra/CJSEval1", {
-    todo: true,
     files: {
       "in.js": `if (require('./eval').foo !== 123) throw 'fail'`,
       "eval.js": `exports.foo=234;eval('exports.foo = 123')`,
@@ -442,7 +437,6 @@ describe("bundler", () => {
     run: true,
   });
   itBundled("extra/CJSEval2", {
-    todo: true,
     files: {
       "in.js": `if (require('./eval').foo !== 123) throw 'fail'`,
       "eval.js": `module.exports={foo:234};eval('module.exports = {foo: 123}')`,
@@ -1010,7 +1004,6 @@ describe("bundler", () => {
       run: true,
     });
     itBundled(`extra/${minify.label || "NoMinify"}CatchScope2`, {
-      todo: true,
       files: {
         "in.js": `
           let y
@@ -1334,7 +1327,6 @@ describe("bundler", () => {
     run: true,
   });
   itBundled(`extra/TreeShaking10`, {
-    todo: true,
     files: {
       "entry.js": `
         let [a] = {}; // This must not be tree-shaken
@@ -1353,7 +1345,6 @@ describe("bundler", () => {
     run: { file: "node.js" },
   });
   itBundled(`extra/TreeShaking11`, {
-    todo: true,
     files: {
       "entry.js": `
         let sideEffect = false
@@ -1646,6 +1637,7 @@ describe("bundler", () => {
     run: true,
   });
   itBundled(`extra/FunctionHoistingKeepNames1`, {
+    todo: true, // keepNames requires Object.defineProperty implementation
     files: {
       "in.js": `
       var f
@@ -1657,6 +1649,7 @@ describe("bundler", () => {
     run: true,
   });
   itBundled(`extra/FunctionHoistingKeepNames2`, {
+    todo: true, // keepNames requires Object.defineProperty implementation
     files: {
       "in.js": `
       var f

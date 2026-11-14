@@ -1,4 +1,4 @@
-import { test, expect, describe } from "bun:test";
+import { describe, expect, test } from "bun:test";
 
 // abort-controller
 // 13 million weekly downloads
@@ -18,7 +18,7 @@ describe("abort-controller", () => {
   });
 
   test("ESM", async () => {
-    const AbortControllerPolyfill = await import("abort-controller");
+    const AbortControllerPolyfill = await import("abort-controller" as string);
     // @ts-ignore
     expect(AbortControllerPolyfill.AbortController).toBe(AbortController);
     // @ts-ignore

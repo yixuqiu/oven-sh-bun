@@ -238,6 +238,25 @@ test("no assertion failures", () => {
     assert.strictEqual(util.format("%s", { __proto__: null }), "[Object: null prototype] {}");
   }
 
+  // `%s` with values whose inherited `toString` comes from a non-ECMAScript
+  // built-in (Buffer, URL, ...) must call `String(value)`, not inspect it.
+  assert.strictEqual(util.format("%s", Buffer.from("ab")), "ab");
+  assert.strictEqual(util.format("%s", Buffer.from([0xe2, 0x82, 0xac])), "\u20ac");
+  assert.strictEqual(util.format("%s", new URL("http://a/b")), "http://a/b");
+  assert.strictEqual(util.format("%s", new URLSearchParams("a=1&b=2")), "a=1&b=2");
+  {
+    // Subclass path: toString is inherited through an extra prototype hop.
+    class MyURL extends URL {}
+    assert.strictEqual(util.format("%s", new MyURL("http://a/b")), "http://a/b");
+    class MyBuffer extends Buffer {}
+    const sub = Object.setPrototypeOf(Buffer.from([0x68, 0x69]), MyBuffer.prototype);
+    assert.strictEqual(util.format("%s", sub), "hi");
+  }
+  // Uint8Array inherits toString from %TypedArray%.prototype, not Buffer.
+  assert.strictEqual(util.format("%s", new Uint8Array([65])), "65");
+  // ECMAScript built-ins with their own toString still take the inspect path.
+  assert.strictEqual(util.format("%s", [1, 2]), "[ 1, 2 ]");
+
   // JSON format specifier
   assert.strictEqual(util.format("%j"), "%j");
   assert.strictEqual(util.format("%j", 42), "42");
@@ -317,17 +336,17 @@ test("no assertion failures", () => {
       "  foo: 'bar',\n" +
       "  foobar: 1,\n" +
       "  func: <ref *1> [Function: func] {\n" +
-      "    [prototype]: { [constructor]: [Circular *1] },\n" +
+      "    [length]: 0,\n" +
       "    [name]: 'func',\n" +
-      "    [length]: 0\n" +
+      "    [prototype]: { [constructor]: [Circular *1] }\n" +
       "  }\n" +
       "} {\n" +
       "  foo: 'bar',\n" +
       "  foobar: 1,\n" +
       "  func: <ref *1> [Function: func] {\n" +
-      "    [prototype]: { [constructor]: [Circular *1] },\n" +
+      "    [length]: 0,\n" +
       "    [name]: 'func',\n" +
-      "    [length]: 0\n" +
+      "    [prototype]: { [constructor]: [Circular *1] }\n" +
       "  }\n" +
       "}",
   );
@@ -338,9 +357,9 @@ test("no assertion failures", () => {
       "  foo: 'bar',\n" +
       "  foobar: 1,\n" +
       "  func: <ref *1> [Function: func] {\n" +
-      "    [prototype]: { [constructor]: [Circular *1] },\n" +
+      "    [length]: 0,\n" +
       "    [name]: 'func',\n" +
-      "    [length]: 0\n" +
+      "    [prototype]: { [constructor]: [Circular *1] }\n" +
       "  }\n" +
       "} %o",
   );
@@ -430,6 +449,9 @@ test("no assertion failures", () => {
     }
   }
   const customError = new CustomError("bar");
+  customError.stack;
+  delete customError.originalLine;
+  delete customError.originalColumn;
   assert.strictEqual(util.format(customError), customError.stack.replace(/^Error/, "Custom$&")); //! temp bug workaround
   // Doesn't capture stack trace
   function BadCustomError(msg) {
@@ -475,7 +497,7 @@ test("no assertion failures", () => {
 
   assert.strictEqual(
     util.format(new SharedArrayBuffer(4)),
-    "SharedArrayBuffer { [Uint8Contents]: <00 00 00 00>, byteLength: 4 }",
+    "SharedArrayBuffer { [Uint8Contents]: <00 00 00 00>, [byteLength]: 4 }",
   );
 
   assert.strictEqual(util.formatWithOptions({ colors: true, compact: 3 }, "%s", [1, { a: true }]), "[ 1, [Object] ]");

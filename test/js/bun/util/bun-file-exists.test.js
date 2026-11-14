@@ -1,8 +1,9 @@
-import { test, expect } from "bun:test";
-import { join } from "path";
-import { tmpdir } from "os";
 import { write } from "bun";
-import { unlinkSync } from "fs";
+import { expect, test } from "bun:test";
+import { unlinkSync, writeFileSync } from "fs";
+import { tempDir } from "harness";
+import { tmpdir } from "os";
+import { join } from "path";
 test("bun-file-exists", async () => {
   expect(await Bun.file(import.meta.path).exists()).toBeTrue();
   expect(await Bun.file(import.meta.path + "boop").exists()).toBeFalse();
@@ -17,4 +18,16 @@ test("bun-file-exists", async () => {
   expect(await Bun.file(temp).exists()).toBeTrue();
   unlinkSync(temp);
   expect(await Bun.file(temp).exists()).toBeFalse();
+});
+
+test.each([
+  ["exists()", file => file.exists()],
+  ["size", file => file.size],
+])("one Bun.file() sees a file that is created after %s found none", async (_, look) => {
+  using dir = tempDir("bun-file-exists-later", {});
+  const file = Bun.file(join(String(dir), "later.txt"));
+  await look(file);
+  expect(await file.exists()).toBeFalse();
+  writeFileSync(file.name, "boop");
+  expect(await file.exists()).toBeTrue();
 });

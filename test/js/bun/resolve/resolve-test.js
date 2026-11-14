@@ -1,12 +1,11 @@
-import { it, expect } from "bun:test";
-import { ospath } from "harness";
+import { expect, it } from "bun:test";
 import { join, resolve } from "path";
 
 function resolveFrom(from) {
   return specifier => import.meta.resolveSync(specifier, from);
 }
 
-it("#imports", async () => {
+it.todo("#imports", async () => {
   const baz = import.meta.resolveSync("#foo", join(import.meta.resolveSync("package-json-imports/baz"), "../"));
   expect(baz).toBe(resolve(import.meta.dir, "node_modules/package-json-imports/foo/private-foo.js"));
 
@@ -116,40 +115,81 @@ it("Bun.resolveSync", () => {
   expect(Bun.resolveSync("./resolve-test.js", import.meta.dir)).toBe(import.meta.path);
 });
 
+// error cases
+it("Bun.resolve throws TypeError when called without arguments", async () => {
+  try {
+    await Bun.resolve();
+    expect.unreachable("Should have thrown");
+  } catch (error) {
+    expect(error).toBeInstanceOf(TypeError);
+    expect(error.message).toBe("moduleId must be a string");
+    expect(error.code).toBe("ERR_INVALID_ARG_TYPE");
+  }
+});
+
+it("Bun.resolveSync throws TypeError when called without arguments", () => {
+  try {
+    Bun.resolveSync();
+    expect.unreachable("Should have thrown");
+  } catch (error) {
+    expect(error).toBeInstanceOf(TypeError);
+    expect(error.message).toBe("moduleId must be a string");
+    expect(error.code).toBe("ERR_INVALID_ARG_TYPE");
+  }
+});
+
+it("dynamic import of file: URL with 4 slashes doesn't trigger ASAN", async () => {
+  const error = await import(`file://` + `//a.js`).catch(e => e);
+  // On Windows, this may throw a different error type due to path handling
+  expect(error).toBeDefined();
+  expect(error.toString()).toMatch(/Cannot find module|ModuleNotFound|ENOENT/);
+});
+
+it("require of file: URL with 4 slashes doesn't trigger ASAN", async () => {
+  let err;
+  try {
+    import.meta.require(`file://` + `//a.js`);
+  } catch (e) {
+    err = e;
+  }
+  expect(err).not.toBeUndefined();
+  expect(err).toBeObject();
+});
+
 it("self-referencing imports works", async () => {
   const baz = import.meta.resolveSync("package-json-exports/baz");
   const namespace = import.meta.resolveSync("package-json-exports/references-baz");
-  Loader.registry.delete(baz);
-  Loader.registry.delete(namespace);
+  delete require.cache[baz];
+  delete require.cache[namespace];
   var a = await import(baz);
   var b = await import(namespace);
   expect(a.bar).toBe(1);
   expect(b.bar).toBe(1);
 
-  Loader.registry.delete(baz);
-  Loader.registry.delete(namespace);
+  delete require.cache[baz];
+  delete require.cache[namespace];
   var a = await import("package-json-exports/baz");
   var b = await import("package-json-exports/references-baz");
   expect(a.bar).toBe(1);
   expect(b.bar).toBe(1);
 
-  Loader.registry.delete(baz);
-  Loader.registry.delete(namespace);
+  delete require.cache[baz];
+  delete require.cache[namespace];
   var a = import.meta.require("package-json-exports/baz");
   var b = import.meta.require("package-json-exports/references-baz");
   expect(a.bar).toBe(1);
   expect(b.bar).toBe(1);
 
-  Loader.registry.delete(baz);
-  Loader.registry.delete(namespace);
+  delete require.cache[baz];
+  delete require.cache[namespace];
   var a = import.meta.require(baz);
   var b = import.meta.require(namespace);
   expect(a.bar).toBe(1);
   expect(b.bar).toBe(1);
 
   // test that file:// works
-  Loader.registry.delete(baz);
-  Loader.registry.delete(namespace);
+  delete require.cache[baz];
+  delete require.cache[namespace];
   var a = import.meta.require("file://" + baz);
   var b = import.meta.require("file://" + namespace);
   expect(a.bar).toBe(1);

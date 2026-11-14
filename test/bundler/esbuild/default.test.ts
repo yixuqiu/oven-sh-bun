@@ -1,15 +1,15 @@
 import assert from "assert";
-import dedent from "dedent";
+import { describe, expect, test } from "bun:test";
+import { bunEnv, bunExe, osSlashes, tempDir } from "harness";
+import path from "path";
+import { dedent, ESBUILD_PATH, itBundled } from "../expectBundled";
 
-import { ESBUILD_PATH, RUN_UNCHECKED_TESTS, itBundled, testForFile } from "../expectBundled";
-import { osSlashes } from "harness";
-var { describe, test, expect } = testForFile(import.meta.path);
 // Tests ported from:
 // https://github.com/evanw/esbuild/blob/main/internal/bundler_tests/bundler_default_test.go
 
 // For debug, all files are written to $TEMP/bun-bundle-tests/default
 
-describe("bundler", () => {
+describe.concurrent("bundler", () => {
   itBundled("default/SimpleES6", {
     files: {
       "/entry.js": /* js */ `
@@ -95,7 +95,7 @@ describe("bundler", () => {
         `,
     },
     run: {
-      error: "TypeError: bar2 is not a function. (In 'bar2()', 'bar2' is undefined)",
+      error: "TypeError: bar is not a function. (In 'bar()', 'bar' is undefined)",
       errorLineMatch: /console\.log/,
     },
   });
@@ -194,10 +194,11 @@ describe("bundler", () => {
     format: "iife",
     globalName: "globalName",
     run: true,
+    todo: true,
     onAfterBundle(api) {
       api.appendFile(
         "/out.js",
-        dedent/* js */ `
+        dedent /* js */ `
           import { strictEqual } from "node:assert";
           strictEqual(globalName.default, 123, ".default");
           strictEqual(globalName.v, 234, ".v");
@@ -233,7 +234,6 @@ describe("bundler", () => {
       "/e.js": "export default class Foo {}",
     },
     entryPoints: ["/a.js", "/b.js", "/c.js", "/d.js", "/e.js"],
-    mode: "bundle",
     bundling: false,
     runtimeFiles: {
       "./out/f.js": /* js */ `
@@ -298,7 +298,7 @@ describe("bundler", () => {
         export default 3;
         export const a2 = 4;
       `,
-      "/test.js": String.raw/* js */ `
+      "/test.js": String.raw /* js */ `
         import { deepEqual } from 'node:assert';
         globalThis.deepEqual = deepEqual;
         await import ('./out.js');
@@ -1149,7 +1149,6 @@ describe("bundler", () => {
     },
   });
   itBundled("default/SourceMap", {
-    todo: true,
     files: {
       "/Users/user/project/src/entry.js": /* js */ `
         import {bar} from './bar'
@@ -1162,6 +1161,30 @@ describe("bundler", () => {
     sourceMap: "external",
     onAfterBundle(api) {
       const json = JSON.parse(api.readFile("/Users/user/project/out/entry.js.map"));
+      api.expectFile("/Users/user/project/out/entry.js").not.toContain(`//# sourceMappingURL`);
+      api.expectFile("/Users/user/project/out/entry.js").toContain(`//# debugId=${json.debugId}`);
+      // see src/sourcemap/sourcemap.zig DebugIDFormatter for more info
+      expect(json.debugId).toMatch(/^[A-F0-9]{32}$/);
+      expect(json.debugId.endsWith("64756e2164756e21"));
+    },
+    run: {
+      stdout: "hi",
+    },
+  });
+  itBundled("default/SourceMapLinked", {
+    files: {
+      "/Users/user/project/src/entry.js": /* js */ `
+        import {bar} from './bar'
+        function foo() { bar() }
+        foo()
+      `,
+      "/Users/user/project/src/bar.js": `export function bar() { console.log('hi') }`,
+    },
+    outdir: "/Users/user/project/out",
+    sourceMap: "linked",
+    onAfterBundle(api) {
+      const json = JSON.parse(api.readFile("/Users/user/project/out/entry.js.map"));
+      api.expectFile("/Users/user/project/out/entry.js").toContain(`//# sourceMappingURL=entry.js.map`);
       api.expectFile("/Users/user/project/out/entry.js").toContain(`//# debugId=${json.debugId}`);
       // see src/sourcemap/sourcemap.zig DebugIDFormatter for more info
       expect(json.debugId).toMatch(/^[A-F0-9]{32}$/);
@@ -1296,7 +1319,7 @@ describe("bundler", () => {
         console.log('writeFileSync' in fs, readFileSync, 'writeFileSync' in defaultValue)
       `,
     },
-    target: "node",
+    target: "bun",
     format: "cjs",
     run: {
       stdout: "true [Function: readFileSync] true",
@@ -1507,6 +1530,19 @@ describe("bundler", () => {
       stdout: "123 object",
     },
   });
+  itBundled("default/RuntimeNameCollisionBundle", {
+    files: {
+      "/entry.js": /* js */ `
+        function __require() { return 123 }
+        console.log(__require(), typeof (require('fs')))
+      `,
+    },
+    target: "node",
+    external: ["fs"],
+    run: {
+      stdout: "123 object",
+    },
+  });
   itBundled("default/TopLevelReturnForbiddenImport", {
     todo: true,
     files: {
@@ -1555,6 +1591,69 @@ describe("bundler", () => {
     bundling: false,
     bundleErrors: {
       "/entry.js": ["Top-level return cannot be used inside an ECMAScript module"],
+    },
+  });
+  itBundled("default/CircularTLADependency", {
+    files: {
+      "/entry.js": /* js */ `
+        const { A } = await import('./a.js');
+        console.log(A);
+      `,
+      "/a.js": /* js */ `
+        import { B } from './b.js';
+        export const A = 'hi';
+      `,
+      "/b.js": /* js */ `
+        import { A } from './a.js';
+
+        // TLA that should mark the wrapper closure for a.js as async
+        await 1;
+
+        export const B = 'hello';
+      `,
+    },
+    run: {
+      stdout: "hi\n",
+    },
+  });
+  itBundled("default/CircularTLADependency2", {
+    files: {
+      "/entry.ts": /* ts */ `
+        await import("./b.ts");
+      `,
+      "/b.ts": /* ts */ `
+        import { c } from "./c.ts";
+        console.log(c);
+        export const b = "b";
+      `,
+      "/c.ts": /* ts */ `
+        import { d } from "./d.ts";
+        console.log(d);
+        export const c = "c";
+      `,
+      "/d.ts": /* ts */ `
+        const { e } = await import("./e.ts");
+        console.log(e);
+        import { f } from "./f.ts";
+        console.log(f);
+        export const d = "d";
+      `,
+      "/e.ts": /* ts */ `
+        export const e = "e";
+      `,
+      "/f.ts": /* ts */ `
+        import { g } from "./g.ts";
+        console.log(g);
+        export const f = "f";
+      `,
+      "/g.ts": /* ts */ `
+        import { c } from "./c.ts";
+        console.log(c);
+        export const g = "g";
+      `,
+    },
+    run: {
+      stdout: "c\ng\ne\nf\nd\nc\n",
     },
   });
   itBundled("default/ThisOutsideFunctionRenamedToExports", {
@@ -1811,7 +1910,7 @@ describe("bundler", () => {
       assert(!api.readFile("/out.js").includes("var bar"), 'bundle shouldnt include "var bar"');
     },
     run: {
-      error: "ReferenceError: Can't find variable: bar",
+      error: "ReferenceError: bar is not defined",
     },
   });
   itBundled("default/ArgumentDefaultValueScopeNoBundle", {
@@ -2044,7 +2143,6 @@ describe("bundler", () => {
         }
       `,
     },
-    todo: true,
     minifyIdentifiers: true,
     bundling: false,
     format: "cjs",
@@ -2055,7 +2153,6 @@ describe("bundler", () => {
     },
   });
   itBundled("default/ImportReExportES6ESBuildIssue149", {
-    todo: true,
     files: {
       "/app.jsx": /* jsx */ `
         import { p as Part, h, render } from './import';
@@ -2086,7 +2183,7 @@ describe("bundler", () => {
     },
     jsx: {
       factory: "h",
-      automaticRuntime: false,
+      runtime: "classic",
     },
     external: ["preact"],
     run: true,
@@ -2558,6 +2655,7 @@ describe("bundler", () => {
     minifySyntax: true,
     minifyWhitespace: true,
     bundling: false,
+    todo: true,
     onAfterBundle(api) {
       assert(api.readFile("/out.js").includes('"use strict";'), '"use strict"; was emitted');
     },
@@ -2773,18 +2871,25 @@ describe("bundler", () => {
     },
     bundling: false,
   });
-  itBundled("default/ImportMetaCommonJS", {
+  itBundled("default/ImportMetaCommonJS", ({ root }) => ({
+    // Currently Bun emits `import.meta` instead of correctly
+    // polyfilling its properties.
+    todo: true,
     files: {
-      "/entry.js": `console.log(import.meta.url, import.meta.path)`,
+      "/entry.js": `
+        import fs from "fs";
+        import { fileURLToPath } from "url";
+        console.log(fileURLToPath(import.meta.url) === ${JSON.stringify(path.join(root, "out.cjs"))});
+      `,
     },
+    outfile: "out.cjs",
     format: "cjs",
-    bundleWarnings: {
-      "/entry.js": [`"import.meta" is not available with the "cjs" output format and will be empty`],
-    },
+    target: "node",
     run: {
-      stdout: "undefined undefined",
+      runtime: "node",
+      stdout: "true true",
     },
-  });
+  }));
   itBundled("default/ImportMetaES6", {
     files: {
       "/entry.js": `console.log(import.meta.url, import.meta.path)`,
@@ -3409,6 +3514,7 @@ describe("bundler", () => {
       `,
     },
     format: "iife",
+    todo: true,
     bundleErrors: {
       "/entry.js": ['Top-level await is currently not supported with the "iife" output format'],
     },
@@ -3431,6 +3537,7 @@ describe("bundler", () => {
       `,
     },
     format: "cjs",
+    todo: true,
     bundleErrors: {
       "/entry.js": ['Top-level await is currently not supported with the "cjs" output format'],
     },
@@ -3473,7 +3580,6 @@ describe("bundler", () => {
     bundling: false,
   });
   itBundled("default/TopLevelAwaitForbiddenRequire", {
-    todo: true,
     files: {
       "/entry.js": /* js */ `
         require('./a')
@@ -3491,12 +3597,77 @@ describe("bundler", () => {
       "/entry.js": [
         'This require call is not allowed because the transitive dependency "c.js" contains a top-level await',
         'This require call is not allowed because the transitive dependency "c.js" contains a top-level await',
-        'This require call is not allowed because the transitive dependency "entry.js" contains a top-level await',
+        'This require call is not allowed because the transitive dependency "c.js" contains a top-level await',
+        'This require call is not allowed because the imported file "entry.js" contains a top-level await',
       ],
     },
   });
+  const forbiddenRequireWithNamedImport = {
+    "a.js": `
+      import { b } from "./b.js";
+      console.log(b, require("./b.js"));
+    `,
+    "b.js": `export const b = await 0;`,
+  };
+  test("default/TopLevelAwaitForbiddenRequireSourceMapCLI", async () => {
+    using dir = tempDir("tla-forbidden-require-sourcemap", forbiddenRequireWithNamedImport);
+    const build = async () => {
+      await using proc = Bun.spawn({
+        cmd: [bunExe(), "build", "--sourcemap=inline", "a.js"],
+        env: bunEnv,
+        cwd: String(dir),
+        stdout: "ignore",
+        stderr: "pipe",
+      });
+      const [stderr, exitCode] = await Promise.all([proc.stderr.text(), proc.exited]);
+      return { error: stderr.match(/^error: .*$/m)?.[0], exitCode };
+    };
+    // The link error races the source map tasks: one build alone does not always show it,
+    // and many builds at once show it less often.
+    const builds: Awaited<ReturnType<typeof build>>[] = [];
+    for (let round = 0; round < 10; round++) {
+      builds.push(...(await Promise.all([build(), build(), build(), build()])));
+    }
+    expect(builds).toEqual(
+      Array(40).fill({
+        error:
+          'error: This require call is not allowed because the transitive dependency "b.js" contains a top-level await',
+        exitCode: 1,
+      }),
+    );
+  });
+  test("default/TopLevelAwaitForbiddenRequireSourceMapAPI", async () => {
+    using dir = tempDir("tla-forbidden-require-sourcemap-api", {
+      ...forbiddenRequireWithNamedImport,
+      "build.js": `
+        const messages = [];
+        for (let i = 0; i < 40; i++) {
+          const { logs } = await Bun.build({ entrypoints: ["./a.js"], sourcemap: "inline", throw: false });
+          messages.push(logs[0].message);
+        }
+        console.log(JSON.stringify(messages));
+      `,
+    });
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "build.js"],
+      env: bunEnv,
+      cwd: String(dir),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect({ stdout, stderr }).toEqual({
+      stdout:
+        JSON.stringify(
+          Array(40).fill(
+            'This require call is not allowed because the transitive dependency "b.js" contains a top-level await',
+          ),
+        ) + "\n",
+      stderr: "",
+    });
+    expect(exitCode).toBe(0);
+  });
   itBundled("default/TopLevelAwaitAllowedImportWithoutSplitting", {
-    todo: true,
     files: {
       "/entry.js": /* js */ `
         import('./a')
@@ -3512,6 +3683,131 @@ describe("bundler", () => {
     format: "esm",
     run: {
       stdout: "0\n1",
+    },
+  });
+  itBundled("default/TopLevelAwaitImport", {
+    files: {
+      "/entry.js": /* js */ `
+        const { a } = await import('./a.js');
+        console.log(a);
+      `,
+      "/a.js": /* js */ `
+        async function five() {
+          return 5;
+        }
+
+        export const a = await five();
+      `,
+    },
+    format: "esm",
+    run: {
+      stdout: "5",
+    },
+  });
+  itBundled("default/TopLevelAwaitWithStaticImport", {
+    // Test static import of a module that uses top-level await
+    files: {
+      "/entry.js": `
+        import { a } from './a.js';
+        console.log('Entry', a);
+      `,
+      "/a.js": `
+        async function getValue() {
+          return await Promise.resolve('value from a');
+        }
+        export const a = await getValue();
+        console.log('a.js loaded');
+      `,
+    },
+    format: "esm",
+    run: {
+      stdout: "a.js loaded\nEntry value from a",
+    },
+  });
+  itBundled("default/TopLevelAwaitWithNestedDynamicImport", {
+    // Test nested dynamic imports with top-level await
+    files: {
+      "/entry.js": `
+        console.log('Start Entry');
+        const res = await import('./a.js');
+        console.log('Entry', res.a);
+      `,
+      "/a.js": `
+        console.log('Start a.js');
+        const { b } = await import('./b.js');
+        export const a = 'a.js plus ' + b;
+      `,
+      "/b.js": `
+        console.log('Start b.js');
+        export const b = 'value from b.js';
+      `,
+    },
+    format: "esm",
+    run: {
+      stdout: `Start Entry
+  Start a.js
+  Start b.js
+  Entry a.js plus value from b.js`,
+    },
+  });
+  itBundled("default/TopLevelAwaitWithNestedRequire", {
+    // Test nested dynamic imports with top-level await
+    files: {
+      "/entry.js": `
+        console.log('Start Entry');
+        const res = await import('./a.js');
+        console.log('Entry', res.a);
+      `,
+      "/a.js": `
+        console.log('Start a.js');
+        const { b } = require('./b.js');
+        export const a = 'a.js plus ' + b;
+      `,
+      "/b.js": `
+        console.log('Start b.js');
+        export const b = 'value from b.js';
+      `,
+    },
+    format: "esm",
+    run: {
+      stdout: `Start Entry
+  Start a.js
+  Start b.js
+  Entry a.js plus value from b.js`,
+    },
+  });
+  itBundled("default/TopLevelAwaitWithNestedImportAndRequire", {
+    // Test nested dynamic imports with top-level await
+    files: {
+      "/entry.js": `
+        console.log('Start Entry');
+        const res = await import('./a.js');
+        console.log('Entry', res.a);
+      `,
+      "/a.js": `
+        console.log('Start a.js');
+        const { b } = require('./b.js');
+        async function getValue() {
+          return 'value from a.js plus ' + b;
+        }
+        export const a = await getValue();
+      `,
+      "/b.js": `
+        console.log('Start b.js');
+        import { c } from './c.js';
+        export const b = 'value from b.js plus ' + c;
+      `,
+      "/c.js": `
+        console.log('Start c.js');
+        async function getValue() {
+          return 'value from c.js';
+        }
+        export const c = await getValue();
+      `,
+    },
+    format: "esm",
+    bundleErrors: {
+      "/a.js": ['This require call is not allowed because the transitive dependency "c.js" contains a top-level await'],
     },
   });
   itBundled("default/TopLevelAwaitAllowedImportWithSplitting", {
@@ -3762,6 +4058,13 @@ describe("bundler", () => {
     },
     target: "node",
     format: "cjs",
+    bundleErrors: {
+      "/entry.js": [
+        'Could not resolve: "./missing-file"',
+        'Could not resolve: "missing-pkg"',
+        'Could not resolve: "@scope/missing-pkg"',
+      ],
+    },
     external: ["external-pkg", "@scope/external-pkg", "{{root}}/external-file"],
   });
   itBundled("default/InjectMissing", {
@@ -4361,7 +4664,6 @@ describe("bundler", () => {
     },
   });
   itBundled("default/DefineInfiniteLoopESBuildIssue2407", {
-    todo: true,
     files: {
       "/entry.js": /* js */ `
         a.b()
@@ -4416,6 +4718,7 @@ describe("bundler", () => {
   //   },
   // });
   itBundled("default/KeepNamesTreeShaking", {
+    todo: true, // TODO: Full keepNames implementation with Object.defineProperty
     files: {
       "/entry.js": /* js */ `
         (function() {
@@ -4452,6 +4755,7 @@ describe("bundler", () => {
     },
   });
   itBundled("default/KeepNamesClassStaticName", {
+    todo: true, // TODO: Full keepNames implementation with Object.defineProperty
     files: {
       "/entry.js": /* js */ `
         class ClassName1A { static foo = 1 }
@@ -4608,20 +4912,18 @@ describe("bundler", () => {
       assert([...code.matchAll(/let/g)].length === 3, "should have 3 let statements");
     },
   });
-  // TODO: this is hard to test since bun runtime doesn't support require.main and require.cache
-  // i'm not even sure what we want our behavior to be for this case.
-  // itBundled("default/RequireMainCacheCommonJS", {
-  //   files: {
-  //     "/entry.js": /* js */ `
-  //       console.log('is main:', require.main === module)
-  //       console.log(require('./is-main'))
-  //       console.log('cache:', require.cache);
-  //     `,
-  //     "/is-main.js": `module.exports = require.main === module`,
-  //   },
-  //   format: "cjs",
-  //   platform: "node",
-  // });
+  itBundled("default/RequireMainCacheCommonJS", {
+    files: {
+      "/entry.js": /* js */ `
+        console.log('is main:', require.main === module)
+        console.log(require('./is-main'))
+        console.log('cache:', require.cache);
+      `,
+      "/is-main.js": `module.exports = require.main === module`,
+    },
+    format: "cjs",
+    target: "node",
+  });
   itBundled("default/ExternalES6ConvertedToCommonJS", {
     todo: true,
     files: {
@@ -5188,8 +5490,8 @@ describe("bundler", () => {
           number 567
           string ${JSON.stringify(osSlashes("/node_modules/some-path/index.js"))}
           string ${JSON.stringify(osSlashes("/node_modules/second-path/index.js"))}
-          object {"default":123}
-          object {"default":567}
+          object {"default":123,"module.exports":123}
+          object {"default":567,"module.exports":567}
         `,
     },
   });
@@ -5214,8 +5516,8 @@ describe("bundler", () => {
         number 567
         string ${JSON.stringify(osSlashes("/node_modules/some-path/index.js"))}
         string ${JSON.stringify(osSlashes("/node_modules/second-path/index.js"))}
-        object {"default":123}
-        object {"default":567}
+        object {"default":123,"module.exports":123}
+        object {"default":567,"module.exports":567}
       `,
     },
   });

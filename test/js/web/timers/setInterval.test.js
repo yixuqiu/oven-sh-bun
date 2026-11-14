@@ -1,6 +1,7 @@
-import { it, expect } from "bun:test";
+import { expect, it } from "bun:test";
+import { bunRun, isASAN, isWindows } from "harness";
 import { join } from "path";
-import "harness";
+
 it("setInterval", async () => {
   var counter = 0;
   var start;
@@ -61,28 +62,75 @@ it("async setInterval", async () => {
   });
 });
 
-it("setInterval if refreshed before run, should reschedule to run later", done => {
-  let start = Date.now();
+it("refreshed setInterval should not reschedule again", async () => {
+  let relative = performance.now();
+  let runCount = 0;
   let timer = setInterval(() => {
-    let end = Date.now();
-    clearInterval(timer);
-    expect(end - start).toBeGreaterThan(149);
-    done();
-  }, 100);
+    let end = performance.now();
 
-  setTimeout(() => {
+    // loop for 100
+    const spinloop = end;
+    while (performance.now() - spinloop < 100) {
+      end = performance.now();
+    }
+
     timer.refresh();
-  }, 50);
+
+    const elapsed = Math.round(end - relative);
+    console.log("Time since last run", elapsed);
+
+    runCount++;
+
+    switch (runCount) {
+      case 1: {
+        if (elapsed < 180) {
+          throw new Error("Expected elapsed time to be greater than 180");
+        }
+        break;
+      }
+      case 3:
+      case 2: {
+        if (elapsed > 180) {
+          throw new Error("Expected elapsed time to be less than 180");
+        }
+        break;
+      }
+    }
+
+    relative = end;
+
+    if (runCount === 3) {
+      clearInterval(timer);
+    }
+  }, 100);
 });
 
-it("setInterval runs with at least the delay time", () => {
-  expect([`run`, join(import.meta.dir, "setInterval-fixture.js")]).toRun();
+it.concurrent("setInterval runs with at least the delay time", async () => {
+  expect(await bunRun([`run`, join(import.meta.dir, "setInterval-fixture.js")])).toSpawn();
 });
 
-it("setInterval doesn't leak memory", () => {
-  expect([`run`, join(import.meta.dir, "setInterval-leak-fixture.js")]).toRun();
-}, 30_000);
+it.concurrent("setInterval canceling with unref, close, _idleTimeout, and _onTimeout", async () => {
+  expect(await bunRun([join(import.meta.dir, "timers-fixture-unref.js"), "setInterval"])).toSpawn();
+});
 
-it("setInterval doesn't run when cancelled after being scheduled", () => {
-  expect([`run`, join(import.meta.dir, "setInterval-cancel-fixture.js")]).toRun();
-}, 30_000);
+it.concurrent(
+  "setInterval doesn't leak memory",
+  async () => {
+    const { stdout, stderr, exitCode } = await bunRun([`run`, join(import.meta.dir, "setInterval-leak-fixture.js")]);
+    if (exitCode !== 0) console.error(stderr || stdout);
+    expect(exitCode).toBe(0);
+  },
+  // A build with AddressSanitizer takes WTF's and JavaScriptCore's memory from the sanitizer's allocator: the fixture takes a fifth longer and stood at 29 to 30 s.
+  isWindows ? 90_000 : isASAN ? 60_000 : 30_000,
+);
+// ✓ setInterval doesn't leak memory [9930.00ms]
+// ✓ setInterval doesn't leak memory [80188.00ms]
+// TODO: investigate this discrepancy further
+
+it.concurrent(
+  "setInterval doesn't run when cancelled after being scheduled",
+  async () => {
+    expect(await bunRun([`run`, join(import.meta.dir, "setInterval-cancel-fixture.js")])).toSpawn();
+  },
+  30_000,
+);

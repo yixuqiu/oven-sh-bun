@@ -1,8 +1,8 @@
 // @ts-nocheck
-import readline from "node:readline";
-import { Writable, PassThrough } from "node:stream";
-import { EventEmitter } from "node:events";
 import { createTest } from "node-harness";
+import { EventEmitter } from "node:events";
+import readline from "node:readline";
+import { PassThrough, Readable, Writable } from "node:stream";
 const { beforeEach, describe, it, createDoneDotAll, createCallCheckCtx, assert } = createTest(import.meta.path);
 
 var {
@@ -90,9 +90,13 @@ describe("readline.clearScreenDown()", () => {
 
   it("should throw on invalid callback", () => {
     // Verify that clearScreenDown() throws on invalid callback.
-    assert.throws(() => {
+    expect(() => {
       readline.clearScreenDown(writable, null);
-    }, /ERR_INVALID_ARG_TYPE/);
+    }).toThrowError(
+      expect.objectContaining({
+        code: "ERR_INVALID_ARG_TYPE",
+      }),
+    );
   });
 
   it("should that clearScreenDown() does not throw on null or undefined stream", done => {
@@ -138,9 +142,13 @@ describe("readline.clearLine()", () => {
 
   it("should throw on an invalid callback", () => {
     // Verify that clearLine() throws on invalid callback.
-    assert.throws(() => {
+    expect(() => {
       readline.clearLine(writable, 0, null);
-    }, /ERR_INVALID_ARG_TYPE/);
+    }).toThrowError(
+      expect.objectContaining({
+        code: "ERR_INVALID_ARG_TYPE",
+      }),
+    );
   });
 
   it("should not throw on null or undefined stream", done => {
@@ -188,9 +196,13 @@ describe("readline.moveCursor()", () => {
 
   it("should throw on invalid callback", () => {
     // Verify that moveCursor() throws on invalid callback.
-    assert.throws(() => {
+    expect(() => {
       readline.moveCursor(writable, 1, 1, null);
-    }, /ERR_INVALID_ARG_TYPE/);
+    }).toThrowError(
+      expect.objectContaining({
+        code: "ERR_INVALID_ARG_TYPE",
+      }),
+    );
   });
 
   it("should not throw on null or undefined stream", done => {
@@ -281,9 +293,13 @@ describe("readline.cursorTo()", () => {
 
   it("should throw on invalid callback", () => {
     // Verify that cursorTo() throws on invalid callback.
-    assert.throws(() => {
+    expect(() => {
       readline.cursorTo(writable, 1, 1, null);
-    }, /ERR_INVALID_ARG_TYPE/);
+    }).toThrowError(
+      expect.objectContaining({
+        code: "ERR_INVALID_ARG_TYPE",
+      }),
+    );
   });
 
   it("should throw if x or y is NaN", () => {
@@ -467,7 +483,7 @@ describe("readline.Interface", () => {
   });
 
   it("should throw if historySize is not a positive number", () => {
-    ["not a number", -1, NaN, {}, true, Symbol(), null].forEach(historySize => {
+    ["not a number", {}, true, Symbol(), null].forEach(historySize => {
       assert.throws(
         () => {
           readline.createInterface({
@@ -476,10 +492,22 @@ describe("readline.Interface", () => {
           });
         },
         {
-          // TODO: Revert to Range error when properly implemented errors with multiple bases
-          // name: "RangeError",
           name: "TypeError",
-          code: "ERR_INVALID_ARG_VALUE",
+          code: "ERR_INVALID_ARG_TYPE",
+        },
+      );
+    });
+    [-1, NaN].forEach(historySize => {
+      assert.throws(
+        () => {
+          readline.createInterface({
+            input,
+            historySize,
+          });
+        },
+        {
+          name: "RangeError",
+          code: "ERR_OUT_OF_RANGE",
         },
       );
     });
@@ -1304,7 +1332,10 @@ describe("readline.Interface", () => {
     assert.strictEqual(getStringWidth("你好"), 4);
     assert.strictEqual(getStringWidth("안녕하세요"), 10);
     assert.strictEqual(getStringWidth("A\ud83c\ude00BC"), 5);
-    assert.strictEqual(getStringWidth("👨‍👩‍👦‍👦"), 2);
+    // Node v26.3.0 measures each emoji in a ZWJ sequence individually:
+    // internalBinding("icu").getStringWidth's expand_emoji_sequence defaults
+    // on (src/node_i18n.cc:649), so the family emoji is 2+0+2+0+2+0+2.
+    assert.strictEqual(getStringWidth("👨‍👩‍👦‍👦"), 8);
     assert.strictEqual(getStringWidth("🐕𐐷あ💻😀"), 9);
     // TODO(BridgeAR): This should have a width of 4.
     assert.strictEqual(getStringWidth("⓬⓪"), 2);
@@ -1897,6 +1928,20 @@ describe("readline.createInterface()", () => {
     expect(result).toEqual(["Line1", "Line2", "Line3", "Line4"]);
   });
 
+  it("should yield every line via for await...of when the input ends while the iterator is paused", async () => {
+    // The line iterator pauses the interface once more than 1024 lines are queued.
+    // One chunk delivers all of these lines, then the input ends and closes the interface.
+    const lines = Array.from({ length: 1100 }, (_, i) => "line " + i);
+    const rl = readline.createInterface({
+      input: Readable.from([lines.join("\n") + "\n"]),
+      crlfDelay: Infinity,
+    });
+
+    const result = [];
+    for await (const line of rl) result.push(line);
+    expect(result).toEqual(lines);
+  });
+
   it("should respond to home and end sequences for common pttys ", () => {
     const input = new PassThrough();
     const rl = readline.createInterface({
@@ -2010,4 +2055,67 @@ describe("readline.createInterface()", () => {
   //   rl.write("text");
   //   rl.write(null, { ctrl: true, name: "c" });
   // });
+
+  it("should support Symbol.dispose for using statements", () => {
+    const input = new PassThrough();
+    const output = new PassThrough();
+    let closed = false;
+
+    {
+      using rl = readline.createInterface({
+        input: input,
+        output: output,
+      });
+
+      rl.on("close", () => {
+        closed = true;
+      });
+
+      // Verify the interface has the Symbol.dispose method
+      assert.strictEqual(typeof rl[Symbol.dispose], "function");
+      assert.strictEqual(!closed, true);
+    }
+
+    // After exiting the using block, the interface should be closed
+    assert.strictEqual(closed, true);
+  });
+
+  it("Symbol.dispose method is named '[Symbol.dispose]' (a string, as Node's assignFunctionName produces)", () => {
+    const fn = readline.Interface.prototype[Symbol.dispose];
+    // Node names it via assignFunctionName(SymbolDispose, fn), which stringifies the
+    // Symbol to `[${description}]`. A raw Symbol here throws on any coercion of .name.
+    assert.strictEqual(typeof fn.name, "string");
+    assert.strictEqual(fn.name, "[Symbol.dispose]");
+    assert.strictEqual(`${fn.name}`, "[Symbol.dispose]");
+    assert.deepStrictEqual(Object.getOwnPropertyDescriptor(fn, "name"), {
+      value: "[Symbol.dispose]",
+      writable: false,
+      enumerable: false,
+      configurable: true,
+    });
+  });
+
+  it("should support Symbol.dispose as alias for close()", () => {
+    const input = new PassThrough();
+    const output = new PassThrough();
+    let closed = false;
+
+    const rl = readline.createInterface({
+      input: input,
+      output: output,
+    });
+
+    rl.on("close", () => {
+      closed = true;
+    });
+
+    // Verify Symbol.dispose exists and works the same as close()
+    assert.strictEqual(typeof rl[Symbol.dispose], "function");
+    assert.strictEqual(!closed, true);
+
+    rl[Symbol.dispose]();
+
+    assert.strictEqual(closed, true);
+    assert.strictEqual(rl.closed, true);
+  });
 });

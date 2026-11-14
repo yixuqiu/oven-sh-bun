@@ -1,4 +1,9 @@
+import { heapStats } from "bun:jsc";
+
 // This file is meant to be able to run in node and bun
+// ASAN's quarantine retains freed allocations (default 256 MB) so RSS deltas
+// run far higher under bun-asan; widen the threshold to avoid false positives.
+const isASAN = process.execPath.includes("bun-asan");
 const http2 = require("http2");
 const { TLS_OPTIONS, nodeEchoServer } = require("./http2-helpers.cjs");
 function getHeapStats() {
@@ -15,13 +20,16 @@ function getHeapStats() {
   }
 }
 const gc = globalThis.gc || globalThis.Bun?.gc || (() => {});
+const rss = process.memoryUsage.rss;
 const sleep = dur => new Promise(resolve => setTimeout(resolve, dur));
+const ASAN_MULTIPLIER = process.env.ASAN_OPTIONS ? 1 / 10 : 1;
 
 // X iterations should be enough to detect a leak
-const ITERATIONS = 20;
+const ITERATIONS = 20 * ASAN_MULTIPLIER;
 // lets send a bigish payload
-const PAYLOAD = Buffer.from("BUN".repeat((1024 * 128) / 3));
-const MULTIPLEX = 50;
+// const PAYLOAD = Buffer.from("BUN".repeat((1024 * 128) / 3));
+const PAYLOAD = Buffer.alloc(1024 * 128, "b");
+const MULTIPLEX = 50 * ASAN_MULTIPLIER;
 
 async function main() {
   let info;
@@ -84,29 +92,29 @@ async function main() {
 
   try {
     const startStats = getHeapStats();
-
     // warm up
     await runRequests(ITERATIONS);
+
     await sleep(10);
     gc(true);
     // take a baseline
-    const baseline = process.memoryUsage.rss();
-    console.error("Initial memory usage", (baseline / 1024 / 1024) | 0, "MB");
+    const baseline = rss();
 
     // run requests
     await runRequests(ITERATIONS);
-    await sleep(10);
     gc(true);
+    await sleep(10);
+
     // take an end snapshot
-    const end = process.memoryUsage.rss();
+    const end = rss();
 
     const delta = end - baseline;
     const deltaMegaBytes = (delta / 1024 / 1024) | 0;
     console.error("Memory delta", deltaMegaBytes, "MB");
 
     // we executed 100 requests per iteration, memory usage should not go up by 10 MB
-    if (deltaMegaBytes > 20) {
-      console.log("Too many bodies leaked", deltaMegaBytes);
+    if (deltaMegaBytes > (isASAN ? 256 : 20)) {
+      console.error("Too many bodies leaked", deltaMegaBytes);
       process.exit(1);
     }
 

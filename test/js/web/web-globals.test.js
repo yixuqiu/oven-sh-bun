@@ -1,6 +1,8 @@
 import { spawn } from "bun";
-import { expect, it, test } from "bun:test";
-import { bunEnv, bunExe, isLinux, isMacOS, isWindows, withoutAggressiveGC } from "harness";
+import { describe, expect, it, test } from "bun:test";
+import { bunEnv, bunExe, isLinux, isMacOS, isWindows, tempDir, withoutAggressiveGC } from "harness";
+import { join } from "node:path";
+import storesThatEndInADefinition from "../bun/jsc/stores-that-end-in-a-definition-fixture.js";
 
 test("exists", () => {
   expect(typeof URL !== "undefined").toBe(true);
@@ -27,6 +29,10 @@ test("exists", () => {
   expect(typeof PerformanceMeasure !== "undefined").toBe(true);
   expect(typeof PerformanceObserver !== "undefined").toBe(true);
   expect(typeof PerformanceObserverEntryList !== "undefined").toBe(true);
+  expect(typeof PerformanceResourceTiming !== "undefined").toBe(true);
+  expect(typeof PerformanceServerTiming !== "undefined").toBe(true);
+  expect(typeof PerformanceTiming !== "undefined").toBe(true);
+  expect(typeof Math.sumPrecise !== "undefined").toBe(true);
 });
 
 const globalSetters = [
@@ -80,6 +86,203 @@ for (const [Constructor, name, eventName, prop] of globalSetters) {
   });
 }
 
+// Assigning onmessage/onerror through a receiver that is not the global object
+// (e.g. a Proxy of globalThis) used to crash with a type confusion.
+test.concurrent("onmessage/onerror assignment through a Proxy of globalThis", async () => {
+  const script = `
+    const messages = [];
+    const onMessage = e => messages.push(e.data);
+    new Proxy(globalThis, {}).onmessage = onMessage;
+    if (globalThis.onmessage !== onMessage) throw new Error("onmessage not installed through Proxy");
+    dispatchEvent(new MessageEvent("message", { data: "hello" }));
+    if (messages.join() !== "hello") throw new Error("onmessage not dispatched");
+    new Proxy(globalThis, {}).onmessage = null;
+    if (globalThis.onmessage !== null) throw new Error("onmessage not cleared through Proxy");
+
+    const onError = () => {};
+    new Proxy(globalThis, {}).onerror = onError;
+    if (globalThis.onerror !== onError) throw new Error("onerror not installed through Proxy");
+    new Proxy(globalThis, {}).onerror = null;
+    if (globalThis.onerror !== null) throw new Error("onerror not cleared through Proxy");
+
+    with (new Proxy(globalThis, {})) { onmessage = function () {} }
+    if (typeof globalThis.onmessage !== "function") throw new Error("onmessage not installed through with scope");
+    globalThis.onmessage = null;
+    console.log("ok");
+  `;
+  await using proc = Bun.spawn({
+    cmd: [bunExe(), "-e", script],
+    env: bunEnv,
+    stderr: "pipe",
+  });
+  const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+  expect(stderr).toBe("");
+  expect(stdout).toBe("ok\n");
+  expect(exitCode).toBe(0);
+});
+
+test.concurrent("worker: onmessage assignment through a Proxy of self", async () => {
+  using dir = tempDir("worker-proxy-onmessage", {
+    "worker.js": `
+      new Proxy(self, {}).onmessage = e => postMessage("echo:" + e.data);
+      postMessage("ready");
+    `,
+    "main.js": `
+      const worker = new Worker(new URL("./worker.js", import.meta.url).href);
+      worker.onmessage = e => {
+        if (e.data === "ready") {
+          worker.postMessage("hi");
+        } else {
+          console.log(e.data);
+          worker.terminate();
+        }
+      };
+    `,
+  });
+  await using proc = Bun.spawn({
+    cmd: [bunExe(), "main.js"],
+    env: bunEnv,
+    cwd: String(dir),
+    stderr: "pipe",
+  });
+  const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+  expect(stderr).toBe("");
+  expect(stdout).toBe("echo:hi\n");
+  expect(exitCode).toBe(0);
+});
+
+// Each store of the fixture ends in a definition of the value on the global object. The handler is installed, a
+// later direct store replaces it, and a clear through a proxy removes it: nothing keeps the process or the worker
+// alive after that.
+const storesFixture = join(import.meta.dir, "..", "bun", "jsc", "stores-that-end-in-a-definition-fixture.js");
+
+test.concurrent(
+  "onmessage/onerror: every store that ends in a definition on globalThis installs the handler",
+  async () => {
+    const script = `
+    const stores = require(${JSON.stringify(storesFixture)});
+    const events = {
+      onmessage: () => new MessageEvent("message", { data: "payload" }),
+      onerror: () => new ErrorEvent("error", { error: "payload" }),
+    };
+    for (const [what, store] of Object.entries(stores)) {
+      for (const [name, makeEvent] of Object.entries(events)) {
+        const where = what + ", " + name;
+        const seen = [];
+        const first = event => seen.push("first:" + (event.data ?? event.error));
+        const second = event => seen.push("second:" + (event.data ?? event.error));
+        store(globalThis, name, first);
+        if (globalThis[name] !== first) throw new Error(where + ": not read back");
+        dispatchEvent(makeEvent());
+        globalThis[name] = second;
+        dispatchEvent(makeEvent());
+        new Proxy(globalThis, {})[name] = null;
+        if (globalThis[name] !== null) throw new Error(where + ": not cleared through a proxy");
+        dispatchEvent(makeEvent());
+        if (seen.join() !== "first:payload,second:payload") throw new Error(where + ": dispatched " + JSON.stringify(seen));
+        const descriptor = Object.getOwnPropertyDescriptor(globalThis, name);
+        if (JSON.stringify(descriptor) !== '{"value":null,"writable":true,"enumerable":true,"configurable":true}')
+          throw new Error(where + ": descriptor " + JSON.stringify(descriptor));
+      }
+    }
+    console.log("ok");
+  `;
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "-e", script],
+      env: bunEnv,
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect(stderr).toBe("");
+    expect(stdout).toBe("ok\n");
+    expect(exitCode).toBe(0);
+  },
+);
+
+// The global of a node:vm context made from globalThis answers for the properties of globalThis. As the receiver of a
+// Reflect.set it is what the native setter gets as its `this`, and it is no global object of Bun's own.
+test.concurrent(
+  "onmessage/onerror: Reflect.set with the global of a node:vm context of globalThis as the receiver",
+  async () => {
+    const script = `
+    const vm = require("node:vm");
+    const contextGlobal = vm.runInContext("globalThis", vm.createContext(globalThis));
+    const events = {
+      onmessage: () => new MessageEvent("message", { data: "payload" }),
+      onerror: () => new ErrorEvent("error", { error: "payload" }),
+    };
+    const seen = [];
+    for (const [name, makeEvent] of Object.entries(events)) {
+      const handler = event => seen.push(name + ":" + (event.data ?? event.error));
+      if (!Reflect.set({}, name, handler, contextGlobal)) throw new Error(name + ": Reflect.set answered false");
+      if (globalThis[name] !== handler) throw new Error(name + ": not read back");
+      dispatchEvent(makeEvent());
+      if (!Reflect.set({}, name, null, contextGlobal)) throw new Error(name + ": Reflect.set answered false");
+      if (globalThis[name] !== null) throw new Error(name + ": not cleared");
+      dispatchEvent(makeEvent());
+    }
+    console.log(seen.join());
+  `;
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "-e", script],
+      env: bunEnv,
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect(stderr).toBe("");
+    expect(stdout).toBe("onmessage:payload,onerror:payload\n");
+    expect(exitCode).toBe(0);
+  },
+);
+
+test.concurrent("worker: every store that ends in a definition on self installs onmessage", async () => {
+  using dir = tempDir("worker-definition-onmessage", {
+    "worker.js": `
+      const stores = require(${JSON.stringify(storesFixture)});
+      const forms = Object.keys(stores);
+      const next = () => {
+        const what = forms.shift();
+        if (what === undefined) {
+          new Proxy(self, {}).onmessage = null;
+          return;
+        }
+        stores[what](self, "onmessage", e => {
+          postMessage(what + ": " + e.data);
+          next();
+        });
+        postMessage("ready");
+      };
+      next();
+    `,
+    "main.js": `
+      const expected = Object.keys(require(${JSON.stringify(storesFixture)})).map(what => what + ": echo");
+      const worker = new Worker(new URL("./worker.js", import.meta.url).href);
+      const answers = [];
+      worker.onmessage = e => {
+        if (e.data === "ready") return worker.postMessage("echo");
+        answers.push(e.data);
+        // A store that did not install its handler leaves the one before it in place.
+        if (e.data !== expected[answers.length - 1]) worker.terminate();
+      };
+      worker.onerror = event => {
+        answers.push("error: " + event.message);
+        worker.terminate();
+      };
+      worker.addEventListener("close", () => console.log(JSON.stringify(answers)));
+    `,
+  });
+  await using proc = Bun.spawn({
+    cmd: [bunExe(), "main.js"],
+    env: bunEnv,
+    cwd: String(dir),
+    stderr: "pipe",
+  });
+  const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+  expect(stderr).toBe("");
+  expect(JSON.parse(stdout)).toEqual(Object.keys(storesThatEndInADefinition).map(what => what + ": echo"));
+  expect(exitCode).toBe(0);
+});
+
 test("CloseEvent", () => {
   var event = new CloseEvent("close", { reason: "world" });
   expect(event.type).toBe("close");
@@ -131,7 +334,7 @@ it("crypto.getRandomValues", () => {
   expect(!!crypto.getRandomValues(new Uint8Array(8192)).find(a => a > 0)).toBe(true);
 
   {
-    // any additional input into getRandomValues() makes it unbuffered
+    // additional arguments are ignored
     var array = crypto.getRandomValues(foo, "unbuffered");
     expect(array).toBe(foo);
     expect(array.reduce((sum, a) => (sum += a === 0), 0) != foo.length).toBe(true);
@@ -160,7 +363,7 @@ it("crypto.timingSafeEqual", () => {
     crypto.timingSafeEqual(uuid, uuid.slice(0, uuid.length - 2));
     expect.unreachable();
   } catch (e) {
-    expect(e.message).toBe("Input buffers must have the same length");
+    expect(e.message).toBe("Input buffers must have the same byte length");
   }
 
   try {
@@ -186,14 +389,16 @@ it("crypto.randomUUID", () => {
 
   withoutAggressiveGC(() => {
     // check that the fast path works
-    for (let i = 0; i < 9000; i++) {
+    // (45,000 expect() calls don't fit in the test budget on debug builds, so
+    // check the predicate and call expect() on the first malformed UUID only)
+    let malformed;
+    for (let i = 0; i < 9000 && malformed === undefined; i++) {
       var uuid2 = crypto.randomUUID();
-      expect(uuid2.length).toBe(36);
-      expect(uuid2[8]).toBe("-");
-      expect(uuid2[13]).toBe("-");
-      expect(uuid2[18]).toBe("-");
-      expect(uuid2[23]).toBe("-");
+      if (uuid2.length !== 36 || uuid2[8] !== "-" || uuid2[13] !== "-" || uuid2[18] !== "-" || uuid2[23] !== "-") {
+        malformed = uuid2;
+      }
     }
+    expect(malformed).toBeUndefined();
   });
 });
 
@@ -240,7 +445,51 @@ test("navigator", () => {
   }
 });
 
-test("confirm (yes)", async () => {
+// https://github.com/oven-sh/bun/issues/21585
+test.concurrent.each(["userAgent", "platform", "hardwareConcurrency"])(
+  "navigator.%s is a getter-only accessor",
+  async key => {
+    // Spawn a fresh process so we don't mutate the test runner's own navigator object.
+    const k = JSON.stringify(key);
+    const src = `
+    const nav = globalThis.navigator;
+    const before = nav[${k}];
+    const desc = Object.getOwnPropertyDescriptor(nav, ${k});
+    let strictErr = null;
+    try {
+      (function () { "use strict"; nav[${k}] = "overwritten"; })();
+    } catch (e) {
+      strictErr = e.constructor.name;
+    }
+    // indirect eval for sloppy-mode assignment (bun -e is a module / strict by default)
+    (0, eval)('globalThis.navigator[${k}] = "overwritten";');
+    console.log(JSON.stringify({
+      before,
+      after: nav[${k}],
+      desc: { get: typeof desc.get, set: typeof desc.set, enumerable: desc.enumerable, configurable: desc.configurable, hasWritable: "writable" in desc },
+      strictErr,
+    }));
+  `;
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "-e", src],
+      env: bunEnv,
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    const result = JSON.parse(stdout);
+    expect({ ...result, stderr, exitCode }).toEqual({
+      before: result.before,
+      after: result.before,
+      desc: { get: "function", set: "undefined", enumerable: true, configurable: true, hasWritable: false },
+      strictErr: "TypeError",
+      stderr: expect.any(String),
+      exitCode: 0,
+    });
+    expect(result.after).not.toBe("overwritten");
+  },
+);
+
+test("confirm (yes) unix newline", async () => {
   const proc = spawn({
     cmd: [bunExe(), require("path").join(import.meta.dir, "./confirm-fixture.js")],
     stdio: ["pipe", "pipe", "pipe"],
@@ -255,10 +504,28 @@ test("confirm (yes)", async () => {
 
   await proc.exited;
 
-  expect(await new Response(proc.stderr).text()).toBe("Yes\n");
+  expect(await proc.stderr.text()).toBe("Yes\n");
 });
 
-test("confirm (no)", async () => {
+test("confirm (yes) windows newline", async () => {
+  const proc = spawn({
+    cmd: [bunExe(), require("path").join(import.meta.dir, "./confirm-fixture.js")],
+    stdio: ["pipe", "pipe", "pipe"],
+    env: bunEnv,
+  });
+
+  proc.stdin.write("Y");
+  await proc.stdin.flush();
+
+  proc.stdin.write("\r\n"); // Windows-style newline
+  await proc.stdin.flush();
+
+  await proc.exited;
+
+  expect(await proc.stderr.text()).toBe("Yes\n");
+});
+
+test("confirm (no) unix newline", async () => {
   const proc = spawn({
     cmd: [bunExe(), require("path").join(import.meta.dir, "./confirm-fixture.js")],
     stdio: ["pipe", "pipe", "pipe"],
@@ -269,7 +536,46 @@ test("confirm (no)", async () => {
   await proc.stdin.flush();
   await proc.exited;
 
-  expect(await new Response(proc.stderr).text()).toBe("No\n");
+  expect(await proc.stderr.text()).toBe("No\n");
+});
+
+test("confirm (no) windows newline", async () => {
+  const proc = spawn({
+    cmd: [bunExe(), require("path").join(import.meta.dir, "./confirm-fixture.js")],
+    stdio: ["pipe", "pipe", "pipe"],
+    env: bunEnv,
+  });
+
+  proc.stdin.write("poask\r\n");
+  await proc.stdin.flush();
+  await proc.exited;
+
+  expect(await proc.stderr.text()).toBe("No\n");
+});
+
+// Only the CRLF terminator's `\r` is stripped. An earlier `\r` is part of the answer.
+test.concurrent.each([
+  ["hello\r\n", "hello"],
+  ["x\r\r\n", "x\r"],
+  ["\r\r\n", "\r"],
+])("prompt with stdin %j returns %j", async (stdin, expected) => {
+  await using proc = spawn({
+    cmd: [bunExe(), "-e", `console.error(JSON.stringify(prompt("Q?")));`],
+    stdio: ["pipe", "pipe", "pipe"],
+    env: bunEnv,
+  });
+
+  proc.stdin.write(stdin);
+  await proc.stdin.flush();
+  proc.stdin.end();
+
+  const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+
+  expect({ stdout, stderr, exitCode }).toEqual({
+    stdout: "Q? ",
+    stderr: JSON.stringify(expected) + "\n",
+    exitCode: 0,
+  });
 });
 
 test("globalThis.self = 123 works", () => {
@@ -286,4 +592,129 @@ test("globalThis.self = 123 works", () => {
   } finally {
     Object.defineProperty(globalThis, "self", original);
   }
+});
+
+// A constructor reads `new.target.prototype` for the prototype of the object it makes. The read can
+// run script and throw, so it comes after the arguments convert and before the constructor steps.
+describe("new.target.prototype", () => {
+  function unreadableNewTarget() {
+    const newTarget = function () {}.bind(null);
+    Object.defineProperty(newTarget, "prototype", {
+      get() {
+        throw new Error("prototype getter");
+      },
+    });
+    return newTarget;
+  }
+
+  test.each([
+    ["AbortController", AbortController, []],
+    ["Bun.Cookie", Bun.Cookie, ["name", "value"]],
+    ["Bun.CookieMap", Bun.CookieMap, ["a=1"]],
+    ["CloseEvent", CloseEvent, ["close"]],
+    ["CustomEvent", CustomEvent, ["custom"]],
+    ["DOMException", DOMException, ["message", "NotFoundError"]],
+    ["ErrorEvent", ErrorEvent, ["error"]],
+    ["Event", Event, ["event"]],
+    ["EventEmitter (of process)", Object.getPrototypeOf(process).constructor, []],
+    ["EventTarget", EventTarget, []],
+    ["FormData", FormData, []],
+    ["Headers (init)", Headers, [{ a: "1" }]],
+    ["Headers (copy)", Headers, [new Headers({ a: "1" })]],
+    ["MessageChannel", MessageChannel, []],
+    ["MessageEvent", MessageEvent, ["message"]],
+    ["PerformanceMark", PerformanceMark, ["mark"]],
+    ["PerformanceObserver", PerformanceObserver, [() => {}]],
+    ["TextEncoder", TextEncoder, []],
+    ["URL", URL, ["http://example.com/"]],
+    ["URLPattern (pattern, base)", URLPattern, ["/a", "http://example.com/"]],
+    ["URLPattern (init)", URLPattern, [{ pathname: "/a" }]],
+    ["URLSearchParams", URLSearchParams, ["a=1"]],
+  ])("new %s reads it once and gives it to the object", (_name, Constructor, args) => {
+    let reads = 0;
+    const prototype = Object.create(Constructor.prototype);
+    const newTarget = function () {}.bind(null);
+    Object.defineProperty(newTarget, "prototype", {
+      get() {
+        reads++;
+        return prototype;
+      },
+    });
+    const object = Reflect.construct(Constructor, args, newTarget);
+    expect({ reads, prototype: Object.getPrototypeOf(object) === prototype }).toEqual({ reads: 1, prototype: true });
+  });
+
+  test.each([
+    ["URL", URL, ["not a url"]],
+    ["URLPattern (pattern, base)", URLPattern, ["((", "http://example.com/"]],
+    ["URLPattern (init)", URLPattern, [{ pathname: "((" }]],
+    ["Headers", Headers, [{ "bad name": "1" }]],
+    ["Bun.Cookie", Bun.Cookie, ["name", "value", { sameSite: "bogus" }]],
+    ["WebSocket (url)", WebSocket, ["http://[bad"]],
+    ["WebSocket (url, protocol)", WebSocket, ["http://[bad", "chat"]],
+    ["WebSocket (url, options)", WebSocket, ["http://[bad", {}]],
+  ])("new %s: a failed read wins over arguments that the constructor steps reject", (_name, Constructor, args) => {
+    expect(() => new Constructor(...args)).toThrow();
+    expect(() => Reflect.construct(Constructor, args, unreadableNewTarget())).toThrow("prototype getter");
+  });
+
+  test("arguments convert before the read", () => {
+    expect(() => Reflect.construct(URL, [], unreadableNewTarget())).toThrow(TypeError);
+    const url = {
+      toString() {
+        throw new RangeError("toString");
+      },
+    };
+    expect(() => Reflect.construct(URL, [url], unreadableNewTarget())).toThrow(RangeError);
+  });
+
+  test("new PerformanceMark runs its steps before the read, as Node does", () => {
+    expect(() => Reflect.construct(PerformanceMark, ["mark", { startTime: -1 }], unreadableNewTarget())).toThrow(
+      TypeError,
+    );
+  });
+
+  test("new Worker: a failed read leaves the transfer list alone", async () => {
+    const script = "data:text/javascript,";
+    const buffer = new ArrayBuffer(8);
+    const options = { workerData: buffer, transferList: [buffer] };
+    expect(() => Reflect.construct(Worker, [script, options], unreadableNewTarget())).toThrow("prototype getter");
+    expect(buffer.byteLength).toBe(8);
+
+    // A prototype that can be read: the worker starts, takes the buffer, and ends with its empty script.
+    class Subclass extends Worker {}
+    const worker = new Subclass(script, options);
+    expect(Object.getPrototypeOf(worker)).toBe(Subclass.prototype);
+    expect(buffer.byteLength).toBe(0);
+    await new Promise(resolve => worker.addEventListener("close", resolve, { once: true }));
+  });
+
+  test("new ReadableStreamDefaultReader: a failed read leaves the stream alone", async () => {
+    const response = new Response("hello");
+    expect(() => Reflect.construct(ReadableStreamDefaultReader, [response.body], unreadableNewTarget())).toThrow(
+      "prototype getter",
+    );
+    expect(response.bodyUsed).toBe(false);
+    expect(await response.text()).toBe("hello");
+  });
+});
+
+test("dispatchEvent skips a listener that is a WebAssembly GC object", () => {
+  // (module (type $s (struct (field (mut i32))))
+  //   (func (export "mk") (result (ref null $s)) struct.new_default $s))
+  // prettier-ignore
+  const bytes = new Uint8Array([
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+    0x01, 0x0a, 0x02, 0x5f, 0x01, 0x7f, 0x01, 0x60, 0x00, 0x01, 0x63, 0x00,
+    0x03, 0x02, 0x01, 0x01,
+    0x07, 0x06, 0x01, 0x02, 0x6d, 0x6b, 0x00, 0x00,
+    0x0a, 0x07, 0x01, 0x05, 0x00, 0xfb, 0x01, 0x00, 0x0b,
+  ]);
+  const listener = new WebAssembly.Instance(new WebAssembly.Module(bytes)).exports.mk();
+  const target = new EventTarget();
+  let calls = 0;
+  target.addEventListener("a", listener);
+  target.addEventListener("a", () => calls++);
+  target.dispatchEvent(new Event("a"));
+  expect(calls).toBe(1);
 });

@@ -1,94 +1,78 @@
-#include <node.h>
+#include "napi_with_version.h"
 
-#include <iostream>
-#include <napi.h>
+#include "async_tests.h"
+#include "class_test.h"
+#include "conversion_tests.h"
+#include "get_string_tests.h"
+#include "js_test_helpers.h"
+#include "standalone_tests.h"
+#include "wrap_tests.h"
 
-#include <cassert>
+#if defined(__linux__) || defined(__APPLE__)
+#define SUPPRESS_CORE_DUMP
+#endif
 
-napi_value fail(napi_env env, const char *msg) {
-  napi_value result;
-  napi_create_string_utf8(env, msg, NAPI_AUTO_LENGTH, &result);
-  return result;
-}
+#ifdef SUPPRESS_CORE_DUMP
+#include <sys/resource.h>
 
-napi_value ok(napi_env env) {
-  napi_value result;
-  napi_get_undefined(env, &result);
-  return result;
-}
-
-napi_value test_issue_7685(const Napi::CallbackInfo &info) {
-  Napi::Env env(info.Env());
-  Napi::HandleScope scope(env);
-#define napi_assert(expr)                                                      \
-  {                                                                            \
-    if (!expr) {                                                               \
-      Napi::Error::New(env, #expr).ThrowAsJavaScriptException();               \
-    }                                                                          \
+static bool suppress_core_dumps = false;
+__attribute__((constructor)) void suppressCoreDumps() {
+  if (getenv("BUN_INTERNAL_SUPPRESS_CRASH_ON_NAPI_ABORT")) {
+    suppress_core_dumps = true;
+    struct rlimit rl;
+    rl.rlim_cur = 0;
+    rl.rlim_max = 0;
+    setrlimit(RLIMIT_CORE, &rl);
   }
-  napi_assert(info[0].IsNumber());
-  napi_assert(info[1].IsNumber());
-  napi_assert(info[2].IsNumber());
-  napi_assert(info[3].IsNumber());
-  napi_assert(info[4].IsNumber());
-  napi_assert(info[5].IsNumber());
-  napi_assert(info[6].IsNumber());
-  napi_assert(info[7].IsNumber());
-  return ok(env);
 }
+#endif
 
-napi_value
-test_napi_get_value_string_utf8_with_buffer(const Napi::CallbackInfo &info) {
+namespace napitests {
+
+Napi::Value RunCallback(const Napi::CallbackInfo &info) {
   Napi::Env env = info.Env();
-
-  // get how many chars we need to copy
-  uint32_t _len;
-  if (napi_get_value_uint32(env, info[1], &_len) != napi_ok) {
-    return fail(env, "call to napi_get_value_uint32 failed");
-  }
-  size_t len = (size_t)_len;
-
-  if (len == 424242) {
-    len = NAPI_AUTO_LENGTH;
-  } else if (len > 29) {
-    return fail(env, "len > 29");
-  }
-
-  size_t copied;
-  const size_t BUF_SIZE = 30;
-  char buf[BUF_SIZE];
-  memset(buf, '*', BUF_SIZE);
-  buf[BUF_SIZE - 1] = '\0';
-
-  if (napi_get_value_string_utf8(env, info[0], buf, len, &copied) != napi_ok) {
-    return fail(env, "call to napi_get_value_string_utf8 failed");
-  }
-
-  std::cout << "Chars to copy: " << len << std::endl;
-  std::cout << "Copied chars: " << copied << std::endl;
-  std::cout << "Buffer: ";
-  for (size_t i = 0; i < BUF_SIZE; i++) {
-    std::cout << (int)buf[i] << ", ";
-  }
-  std::cout << std::endl;
-  std::cout << "Value str: " << buf << std::endl;
-  return ok(env);
+  // this function is invoked without the GC callback
+  Napi::Function cb = info[0].As<Napi::Function>();
+  return cb.Call(env.Global(), {Napi::String::New(env, "hello world")});
 }
 
-Napi::Object InitAll(Napi::Env env, Napi::Object exports) {
+Napi::Object Init2(Napi::Env env, Napi::Object exports) {
+#ifdef SUPPRESS_CORE_DUMP
+  if (!suppress_core_dumps &&
+      getenv("BUN_INTERNAL_SUPPRESS_CRASH_ON_NAPI_ABORT")) {
+    suppressCoreDumps();
+  }
+#endif
+
+  return Napi::Function::New(env, RunCallback);
+}
+
+Napi::Object InitAll(Napi::Env env, Napi::Object exports1) {
+#ifdef SUPPRESS_CORE_DUMP
+  if (!suppress_core_dumps &&
+      getenv("BUN_INTERNAL_SUPPRESS_CRASH_ON_NAPI_ABORT")) {
+    suppressCoreDumps();
+  }
+#endif
   // check that these symbols are defined
   auto *isolate = v8::Isolate::GetCurrent();
-  node::AddEnvironmentCleanupHook(
-      isolate, [](void *) {}, isolate);
-  node::RemoveEnvironmentCleanupHook(
-      isolate, [](void *) {}, isolate);
 
-  exports.Set("test_issue_7685", Napi::Function::New(env, test_issue_7685));
+  Napi::Object exports = Init2(env, exports1);
 
-  exports.Set(
-      "test_napi_get_value_string_utf8_with_buffer",
-      Napi::Function::New(env, test_napi_get_value_string_utf8_with_buffer));
+  node::AddEnvironmentCleanupHook(isolate, [](void *) {}, isolate);
+  node::RemoveEnvironmentCleanupHook(isolate, [](void *) {}, isolate);
+
+  register_standalone_tests(env, exports);
+  register_async_tests(env, exports);
+  register_class_test(env, exports);
+  register_js_test_helpers(env, exports);
+  register_wrap_tests(env, exports);
+  register_conversion_tests(env, exports);
+  register_get_string_tests(env, exports);
+
   return exports;
 }
 
 NODE_API_MODULE(napitests, InitAll)
+
+} // namespace napitests

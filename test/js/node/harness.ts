@@ -1,17 +1,21 @@
-import { AnyFunction } from "bun";
-import { gcTick, hideFromStackTrace } from "harness";
+/**
+ * @note this file patches `node:test` via the require cache.
+ */
+import { hideFromStackTrace, exampleSite } from "harness";
 import assertNode from "node:assert";
 
 type DoneCb = (err?: Error) => any;
+/** `Parameters<>` only reads the last overload: for node:assert, the one where `message` is required. */
+type OverloadParameters<F> = F extends { (...args: infer A): any; (...args: infer B): any } ? A | B : never;
 function noop() {}
 export function createTest(path: string) {
-  const { expect, test, it, describe, beforeAll, afterAll, beforeEach, afterEach } = Bun.jest(path);
+  const { expect, test, it, describe, beforeAll, afterAll, beforeEach, afterEach, mock } = Bun.jest(path);
 
   hideFromStackTrace(expect);
 
   // Assert
-  const strictEqual = (...args: Parameters<typeof assertNode.strictEqual>) => {
-    assertNode.strictEqual(...args);
+  const strictEqual = (...args: OverloadParameters<typeof assertNode.strictEqual>) => {
+    assertNode.strictEqual(...(args as Parameters<typeof assertNode.strictEqual>));
     expect(true).toBe(true);
   };
 
@@ -126,11 +130,11 @@ export function createTest(path: string) {
       }, exact);
     }
 
-    function mustCallAtLeast(fn: AnyFunction, minimum: number) {
+    function mustCallAtLeast(fn: unknown, minimum: number) {
       return _mustCallInner(fn, minimum, "minimum");
     }
 
-    function _mustCallInner(fn: AnyFunction, criteria = 1, field: string) {
+    function _mustCallInner(fn: unknown, criteria = 1, field: string) {
       // @ts-ignore
       if (process._exiting) throw new Error("Cannot use common.mustCall*() in process exit handler");
       if (typeof fn === "number") {
@@ -173,13 +177,13 @@ export function createTest(path: string) {
       // Refs: https://tc39.es/ecma262/#sec-function-instances
       Object.defineProperties(_return, {
         name: {
-          value: fn.name,
+          value: (fn as Function).name,
           writable: false,
           enumerable: false,
           configurable: true,
         },
         length: {
-          value: fn.length,
+          value: (fn as Function).length,
           writable: false,
           enumerable: false,
           configurable: true,
@@ -255,9 +259,10 @@ export function createTest(path: string) {
     createCallCheckCtx,
     match,
     assert,
+    mock,
   };
 }
-
+export { exampleSite };
 declare namespace Bun {
   function jest(path: string): typeof import("bun:test");
 }

@@ -1,14 +1,17 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { bunEnv, bunExe } from "../../../harness";
 import { Subprocess } from "bun";
-import { copyFileSync, rmSync } from "fs";
+import { install_test_helpers } from "bun:internal-for-testing";
+import { afterAll, beforeAll, expect, test } from "bun:test";
+import { copyFileSync } from "fs";
+import { cp, rm } from "fs/promises";
+import PQueue from "p-queue";
 import { join } from "path";
 import { StringDecoder } from "string_decoder";
-import { cp, rm } from "fs/promises";
+import { bunEnv, bunExe, tmpdirSync, toMatchNodeModulesAt } from "../../../harness";
+const { parseLockfile } = install_test_helpers;
 
-import { tmpdir } from "node:os";
+expect.extend({ toMatchNodeModulesAt });
 
-let root = join(tmpdir(), "ssr" + Math.random().toString(36).slice(2, 4) + "-" + Date.now().toString(36).slice(2, 4));
+let root = tmpdirSync();
 
 beforeAll(async () => {
   await rm(root, { recursive: true, force: true });
@@ -32,7 +35,7 @@ async function getDevServerURL() {
     },
     stdio: ["ignore", "pipe", "inherit"],
   });
-  dev_server.stdout?.unref?.();
+  (dev_server.stdout as any)?.unref?.();
   var hasLoaded = false;
   dev_server_pid = dev_server.pid;
 
@@ -57,16 +60,18 @@ async function getDevServerURL() {
   async function readStream() {
     const string_decoder = new StringDecoder("utf-8");
     const stdout = dev_server!.stdout!;
+    let accumulated = "";
     for await (const chunk of stdout) {
       const str = string_decoder.write(chunk);
       console.error(str);
 
       if (!hasLoaded) {
-        let match = str.match(/http:\/\/localhost:\d+/);
+        accumulated += str;
+        let match = accumulated.match(/http:\/\/localhost:\d+/);
         if (match) {
           baseUrl = match[0];
         }
-        if (str.toLowerCase().includes("ready")) {
+        if (accumulated.toLowerCase().includes("ready") && baseUrl) {
           hasLoaded = true;
           loaded();
         }
@@ -77,24 +82,28 @@ async function getDevServerURL() {
   readStream()
     .catch(e => reject(e))
     .finally(() => {
-      dev_server.unref?.();
+      dev_server!.unref?.();
     });
   await promise;
   return baseUrl;
 }
 
-beforeAll(async () => {
+async function startDevServer() {
   copyFileSync(join(root, "src/Counter1.txt"), join(root, "src/Counter.tsx"));
 
+  // This test never launches a browser (only dev-server.test.ts does), so skip
+  // puppeteer's ~255 MB Chrome download in the postinstall. It hits live CfT
+  // hosts and has flaked on macOS CI, failing the install for nothing.
   const install = Bun.spawnSync([bunExe(), "i"], {
     cwd: root,
-    env: { ...bunEnv, BUN_INSTALL_CACHE_DIR: join(root, "bunstall") },
+    env: { ...bunEnv, BUN_INSTALL_CACHE_DIR: join(root, "bunstall"), PUPPETEER_SKIP_DOWNLOAD: "1" },
     stdout: "inherit",
     stderr: "inherit",
     stdin: "inherit",
   });
   if (!install.success) {
-    throw new Error("Failed to install dependencies");
+    const reason = install.signalCode || `code ${install.exitCode}`;
+    throw new Error(`Failed to install dependencies: ${reason}`);
   }
 
   try {
@@ -104,46 +113,65 @@ beforeAll(async () => {
     dev_server?.kill?.();
     dev_server = undefined;
   }
-});
+  return {
+    [Symbol.dispose]: () => {
+      stopDevServer();
+    },
+  };
+}
 
-afterAll(() => {
+function stopDevServer() {
   if (dev_server_pid) {
-    process?.kill?.(dev_server_pid);
+    const pid = dev_server_pid;
     dev_server_pid = undefined;
+    process?.kill?.(pid);
   }
-});
+}
 
-test("ssr works for 100-ish requests", async () => {
-  expect(dev_server).not.toBeUndefined();
-  expect(baseUrl).not.toBeUndefined();
+afterAll(stopDevServer);
 
-  const batchSize = 16;
-  const promises = [];
-  for (let j = 0; j < 100; j += batchSize) {
-    for (let i = j; i < j + batchSize; i++) {
-      promises.push(
-        (async () => {
-          const x = await fetch(`${baseUrl}/?i=${i}`, {
-            headers: {
-              "Cache-Control": "private, no-cache, no-store, must-revalidate",
-            },
-          });
-          expect(x.status).toBe(200);
-          const text = await x.text();
-          console.count("Completed request");
-          expect(text).toContain(`>${Bun.version}</code>`);
-        })(),
+const timeout = Bun.version.includes("debug") ? 1_000_000 : 100_000;
+test(
+  "ssr works for 100-ish requests",
+  async () => {
+    using devServer = await startDevServer();
+    const { resolve, reject, promise } = Promise.withResolvers();
+    expect(dev_server).not.toBeUndefined();
+    expect(baseUrl).not.toBeUndefined();
+    const lockfile = parseLockfile(root);
+    expect(lockfile).toMatchNodeModulesAt(root);
+    expect(lockfile).toMatchSnapshot();
+    const controller = new AbortController();
+
+    // On an arm64 mac, it doesn't get faster if you increase it beyond 4 as of August, 2025.
+    const queue = new PQueue({ concurrency: 4 });
+
+    async function run(i: number) {
+      const x = await fetch(`${baseUrl}/?i=${i}`, {
+        headers: {
+          "Cache-Control": "private, no-cache, no-store, must-revalidate",
+        },
+        signal: controller.signal,
+      });
+      expect(x.status).toBe(200);
+      const text = await x.text();
+      console.count("Completed request");
+      expect(text).toContain(`>${Bun.version}</code>`);
+    }
+
+    for (let i = 0; i < 100; i++) {
+      queue.add(
+        async () => {
+          await run(i);
+        },
+        { signal: controller.signal },
       );
     }
-    await Promise.allSettled(promises);
-  }
-
-  const x = await Promise.allSettled(promises);
-  const failing = x.filter(x => x.status === "rejected").map(x => x.reason!);
-  if (failing.length) {
-    throw new AggregateError(failing, failing.length + " requests failed", {});
-  }
-  for (const y of x) {
-    expect(y.status).toBe("fulfilled");
-  }
-}, 100000);
+    queue.once("error", e => {
+      reject(e);
+    });
+    queue.onIdle().then(resolve);
+    await promise;
+  },
+  timeout,
+);

@@ -42,7 +42,7 @@ function makeTestJsonResponse(
 
   if (!opts.headers) headers = new Headers();
 
-  if (!(opts.headers instanceof Headers)) headers = new Headers(opts.headers);
+  if (!(opts.headers instanceof Headers)) headers = new Headers(opts.headers as Bun.HeadersInit);
   else headers = opts.headers;
 
   switch (type) {
@@ -67,6 +67,7 @@ function makeTestJsonResponse(
       }
       // Check to set headers
       headers.set("Content-Type", "text/plain");
+      break;
     default:
   }
 

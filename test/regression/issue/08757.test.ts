@@ -1,7 +1,6 @@
-import { test, expect } from "bun:test";
-import { mkdtempSync, symlinkSync } from "fs";
-import { tmpdir } from "os";
-import { bunRun } from "../../harness";
+import { expect, test } from "bun:test";
+import { symlinkSync } from "fs";
+import { bunRun, tmpdirSync } from "../../harness";
 
 if (process.env.IS_SUBPROCESS) {
   console.log(process.argv[1]);
@@ -13,8 +12,8 @@ if (process.env.IS_SUBPROCESS) {
   process.exit(0);
 }
 
-test("absolute path to a file that is symlinked has import.meta.main", () => {
-  const root = mkdtempSync(tmpdir() + "/bun-08757-");
+test.concurrent("absolute path to a file that is symlinked has import.meta.main", async () => {
+  const root = tmpdirSync();
   try {
     symlinkSync(process.argv[1], root + "/main.js");
   } catch (e) {
@@ -25,10 +24,11 @@ test("absolute path to a file that is symlinked has import.meta.main", () => {
     throw e;
   }
 
-  const result = bunRun(root + "/main.js", {
+  const result = await bunRun(root + "/main.js", {
     IS_SUBPROCESS: "1",
   });
-  expect(result.stdout.trim()).toBe(
+  expect(result).toSpawn();
+  expect(result.stdout).toBe(
     [
       //
       import.meta.path,

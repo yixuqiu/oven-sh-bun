@@ -1,6 +1,5 @@
-import fs from "fs";
-import { itBundled, testForFile } from "../expectBundled";
-var { describe, test, expect } = testForFile(import.meta.path);
+import { describe } from "bun:test";
+import { itBundled } from "../expectBundled";
 
 // Tests ported from:
 // https://github.com/evanw/esbuild/blob/main/internal/bundler_tests/bundler_loader_test.go
@@ -64,7 +63,6 @@ describe("bundler", () => {
     ],
   });
   itBundled("loader/File", {
-    todo: process.platform === "win32", // TODO(@paperdave)
     files: {
       "/entry.js": `
         import path from 'path';
@@ -85,7 +83,6 @@ describe("bundler", () => {
     },
   });
   itBundled("loader/FileMultipleNoCollision", {
-    todo: process.platform === "win32", // TODO(@paperdave)
     files: {
       "/entry.js": /* js */ `
         import path from 'path';
@@ -111,7 +108,6 @@ describe("bundler", () => {
     },
   });
   itBundled("loader/FileMultipleNoCollisionAssetNames", {
-    todo: process.platform === "win32", // TODO(@paperdave)
     files: {
       "/entry.js": /* js */ `
         import path from 'path';

@@ -1,5 +1,5 @@
-import { run, bench } from "mitata";
 import { Database } from "bun:sqlite";
+import { bench, run } from "../runner.mjs";
 import { join } from "path";
 
 const db = Database.open(join(import.meta.dir, "src", "northwind.sqlite"));
@@ -23,6 +23,17 @@ const db = Database.open(join(import.meta.dir, "src", "northwind.sqlite"));
   bench('SELECT * FROM "OrderDetail"', () => {
     sql.all();
   });
+}
+
+{
+  const memory = new Database(":memory:");
+
+  for (const statements of [1000, 2000, 4000, 8000]) {
+    const sql = Buffer.alloc(statements * 9, "select 1;").toString();
+    bench(`db.exec(sql): ${statements} statements`, () => {
+      memory.exec(sql);
+    });
+  }
 }
 
 await run();

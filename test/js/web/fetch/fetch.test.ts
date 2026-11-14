@@ -1,32 +1,62 @@
+// @ts-expect-error no such export
 import { AnyFunction, serve, ServeOptions, Server, sleep, TCPSocketListener } from "bun";
-import { afterAll, afterEach, beforeAll, describe, expect, it, beforeEach } from "bun:test";
-import { chmodSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "fs";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
+import { chmodSync, closeSync, ftruncateSync, openSync, rmSync, writeFileSync } from "fs";
+import {
+  bunEnv,
+  bunExe,
+  emptyProcessMaxRSS,
+  exampleSite,
+  exampleHtml as fixture,
+  gc,
+  isASAN,
+  isBroken,
+  isDebug,
+  isFlaky,
+  isMacOS,
+  isRoot,
+  isWindows,
+  rss,
+  runFixtureMaxRSS,
+  tempDir,
+  tls,
+  tmpdirSync,
+  withoutAggressiveGC,
+} from "harness";
+
+import { once } from "events";
 import { mkfifo } from "mkfifo";
-import { tmpdir } from "os";
-import { gzipSync } from "zlib";
-import { join } from "path";
-import { gc, withoutAggressiveGC, gcTick, isWindows } from "harness";
+import type { AddressInfo } from "net";
 import net from "net";
+import { join } from "path";
+import { Readable } from "stream";
+import { gzipSync } from "zlib";
+import { deadPort } from "../../bun/http/proxy-stress-helpers";
 
-const tmp_dir = mkdtempSync(join(realpathSync(tmpdir()), "fetch.test"));
-
-const fixture = readFileSync(join(import.meta.dir, "fetch.js.txt"), "utf8").replaceAll("\r\n", "\n");
-
-let server: Server;
+const tmp_dir = tmpdirSync();
+const fetchFixture3 = join(import.meta.dir, "fetch-leak-test-fixture-3.js");
+const fetchFixture4 = join(import.meta.dir, "fetch-leak-test-fixture-4.js");
+let server: Server<undefined>;
 function startServer({ fetch, ...options }: ServeOptions) {
   server = serve({
+    idleTimeout: 0,
     ...options,
     fetch,
     port: 0,
-  });
+  } as ServeOptions);
+  return server;
 }
 
+let httpServer = exampleSite("http");
+let httpsServer = exampleSite("https");
 afterEach(() => {
   server?.stop?.(true);
 });
 
 afterAll(() => {
   rmSync(tmp_dir, { force: true, recursive: true });
+  httpServer.stop();
+  httpsServer.stop();
 });
 
 const payload = new Uint8Array(1024 * 1024 * 2);
@@ -250,46 +280,91 @@ describe("AbortSignal", () => {
     const controller = new AbortController();
     const signal = controller.signal;
     signal.addEventListener("abort", ev => {
-      const target = ev.currentTarget!;
+      const target = ev.currentTarget! as AbortSignal;
       expect(target).toBeDefined();
       expect(target.aborted).toBe(true);
       expect(target.reason).toBeDefined();
       expect(target.reason!.name).toBe("AbortError");
     });
 
-    expect(async () => {
-      async function manualAbort() {
-        await sleep(10);
-        controller.abort();
-      }
+    async function manualAbort() {
+      await sleep(10);
+      controller.abort();
+    }
+
+    try {
       await Promise.all([fetch(server.url, { signal: signal }).then(res => res.text()), manualAbort()]);
-    }).toThrow(new DOMException("The operation was aborted."));
+      expect.unreachable();
+    } catch (e: any) {
+      expect(e?.message).toEqual("The operation was aborted.");
+      expect(e?.name).toEqual("AbortError");
+      expect(e?.constructor.name).toEqual("DOMException");
+    }
   });
 
   it("AbortErrorWhileUploading", async () => {
     const controller = new AbortController();
 
-    expect(async () => {
+    try {
       await fetch(`http://localhost:${server.port}`, {
         method: "POST",
         body: new ReadableStream({
           pull(event_controller) {
+            console.count("pull");
             event_controller.enqueue(new Uint8Array([1, 2, 3, 4]));
+            //this will abort immediately should abort before connected
+            controller.abort();
+          },
+          cancel(reason) {
+            console.log("cancel", reason);
+          },
+        }),
+        signal: controller.signal,
+      });
+      expect.unreachable();
+    } catch (ex: any) {
+      expect(ex?.message).toEqual("The operation was aborted.");
+      expect(ex?.name).toEqual("AbortError");
+      expect(ex?.constructor.name).toEqual("DOMException");
+    }
+  });
+
+  it("abort while uploading prevents pull() from being called", async () => {
+    const controller = new AbortController();
+    await fetch(`http://localhost:${server.port}`, {
+      method: "POST",
+      body: new Blob(["a"]),
+    });
+
+    try {
+      await fetch(`http://localhost:${server.port}`, {
+        method: "POST",
+        body: new ReadableStream({
+          async pull(event_controller) {
+            expect(controller.signal.aborted).toBeFalse();
+            const chunk = Buffer.alloc(256 * 1024, "abc");
+            for (let i = 0; i < 64; i++) {
+              event_controller.enqueue(chunk);
+            }
             //this will abort immediately should abort before connected
             controller.abort();
           },
         }),
         signal: controller.signal,
       });
-    }).toThrow(new DOMException("The operation was aborted."));
+      expect.unreachable();
+    } catch (ex: any) {
+      expect(ex?.message).toEqual("The operation was aborted.");
+      expect(ex?.name).toEqual("AbortError");
+      expect(ex?.constructor.name).toEqual("DOMException");
+    }
   });
 
   it("TimeoutError", async () => {
     const signal = AbortSignal.timeout(10);
 
-    let server: Server | null = null;
     try {
-      server = Bun.serve({
+      using server = Bun.serve({
         port: 0,
         async fetch() {
           await Bun.sleep(100);
@@ -300,8 +375,8 @@ describe("AbortSignal", () => {
       expect.unreachable();
     } catch (ex: any) {
       expect(ex.name).toBe("TimeoutError");
-    } finally {
-      server?.stop(true);
+      expect(ex.message).toBe("The operation timed out.");
+      expect(ex.constructor.name).toBe("DOMException");
     }
   });
 
@@ -314,11 +389,118 @@ describe("AbortSignal", () => {
     }
 
     try {
-      const request = new Request(server.url, { signal });
+      const request = new Request(server.url as any, { signal });
       await Promise.all([fetch(request).then(res => res.text()), manualAbort()]);
       expect(() => {}).toThrow();
     } catch (ex: any) {
       expect(ex.name).toBe("AbortError");
+    }
+  });
+
+  it("already-aborted signal returns an already-rejected promise", async () => {
+    // Fetch spec step 11: when the signal is already aborted, fetch() must
+    // return an already-rejected promise (not a pending one that settles after
+    // a round-trip to the HTTP thread).
+    {
+      const controller = new AbortController();
+      const reason = new Error("pre-aborted");
+      controller.abort(reason);
+      const p = fetch("http://127.0.0.1:1/", { signal: controller.signal });
+      expect(Bun.peek.status(p)).toBe("rejected");
+      expect<unknown>(Bun.peek(p)).toBe(reason);
+      await p.catch(() => {});
+    }
+    {
+      // default reason → DOMException AbortError, identical to signal.reason
+      const controller = new AbortController();
+      controller.abort();
+      const p = fetch("http://127.0.0.1:1/", { signal: controller.signal });
+      expect(Bun.peek.status(p)).toBe("rejected");
+      const err: unknown = Bun.peek(p);
+      expect(err).toBeInstanceOf(DOMException);
+      expect((err as DOMException).name).toBe("AbortError");
+      expect(err).toBe(controller.signal.reason);
+      await p.catch(() => {});
+    }
+    {
+      // via Request input
+      const controller = new AbortController();
+      const reason = new Error("pre-aborted-req");
+      controller.abort(reason);
+      const req = new Request("http://127.0.0.1:1/", { signal: controller.signal });
+      const p = fetch(req);
+      expect(Bun.peek.status(p)).toBe("rejected");
+      expect<unknown>(Bun.peek(p)).toBe(reason);
+      await p.catch(() => {});
+    }
+    {
+      // AbortSignal.abort() static
+      const reason = new Error("pre-aborted-static");
+      const p = fetch("http://127.0.0.1:1/", { signal: AbortSignal.abort(reason) });
+      expect(Bun.peek.status(p)).toBe("rejected");
+      expect<unknown>(Bun.peek(p)).toBe(reason);
+      await p.catch(() => {});
+    }
+    {
+      // plain-object first argument (request_init_object branch)
+      const controller = new AbortController();
+      const reason = new Error("pre-aborted-init");
+      controller.abort(reason);
+      const p = fetch({ url: "http://127.0.0.1:1/", signal: controller.signal } as any);
+      expect(Bun.peek.status(p)).toBe("rejected");
+      expect<unknown>(Bun.peek(p)).toBe(reason);
+      await p.catch(() => {});
+    }
+    {
+      // Request-constructor errors (spec step 4) still win over the abort:
+      // GET with a body rejects with TypeError, not the abort reason.
+      const reason = new Error("should-not-see-this");
+      const p = fetch("http://127.0.0.1:1/", {
+        method: "GET",
+        body: "x",
+        signal: AbortSignal.abort(reason),
+      } as any);
+      expect(Bun.peek.status(p)).toBe("rejected");
+      expect(Bun.peek(p)).toBeInstanceOf(TypeError);
+      expect(Bun.peek(p)).not.toBe(reason);
+      await p.catch(() => {});
+    }
+    {
+      // Request input body is consumed (step 4) before the abort (step 11).
+      const controller = new AbortController();
+      const reason = new Error("pre-aborted-bodyused");
+      controller.abort(reason);
+      const req = new Request("http://127.0.0.1:1/", {
+        method: "POST",
+        body: "hello",
+        signal: controller.signal,
+      });
+      const p = fetch(req);
+      expect(Bun.peek.status(p)).toBe("rejected");
+      expect<unknown>(Bun.peek(p)).toBe(reason);
+      expect(req.bodyUsed).toBe(true);
+      await p.catch(() => {});
+    }
+    {
+      // ReadableStream body is cancelled with the abort reason (abort-a-fetch
+      // step: "cancel request's body with error").
+      let cancelReason: unknown = "not called";
+      const stream = new ReadableStream({
+        cancel(r) {
+          cancelReason = r;
+        },
+      });
+      const reason = new Error("pre-aborted-stream");
+      const p = fetch("http://127.0.0.1:1/", {
+        method: "POST",
+        body: stream,
+        signal: AbortSignal.abort(reason),
+      });
+      expect(Bun.peek.status(p)).toBe("rejected");
+      expect<unknown>(Bun.peek(p)).toBe(reason);
+      await p.catch(() => {});
+      expect(cancelReason).toBe(reason);
+      expect(stream.locked).toBe(false);
     }
   });
 });
@@ -363,7 +545,7 @@ describe("Headers", () => {
     });
     const result = await fetch(`http://${server.hostname}:${server.port}/`);
     const value = result.headers.get("content-encoding");
-    const body = await result.json();
+    const body: any = await result.json();
     expect(value).toBe("gzip");
     expect(body).toBeDefined();
     expect(body.message).toBe("Hello world");
@@ -405,7 +587,7 @@ describe("Headers", () => {
       ["X-bun", "abc"],
       ["X-bun", "def"],
     ]).toJSON();
-    expect(headers).toEqual({
+    expect<unknown>(headers).toEqual({
       "x-bun": "abc, def",
       "set-cookie": ["foo=bar", "bar=baz"],
     });
@@ -463,13 +645,13 @@ describe("Headers", () => {
 
 describe("fetch", () => {
   const urls = [
-    "https://example.com",
-    "http://example.com",
-    new URL("https://example.com"),
-    new Request({ url: "https://example.com" }),
-    { toString: () => "https://example.com" } as string,
+    { url: httpsServer.url.href, tls: { ca: httpsServer.ca } },
+    { url: httpServer.url.href, tls: undefined },
+    { url: httpsServer.url, tls: { ca: httpsServer.ca } },
+    { url: new Request({ url: httpsServer.url.href }), tls: { ca: httpsServer.ca } },
+    { url: { toString: () => httpServer.url.href } as string, tls: undefined },
   ];
-  for (let url of urls) {
+  for (let { url, tls } of urls) {
     gc();
     let name: string;
     if (url instanceof URL) {
@@ -481,9 +663,9 @@ describe("fetch", () => {
     } else {
       name = url as string;
     }
-    it(name, async () => {
+    it.concurrent(name, async () => {
       gc();
-      const response = await fetch(url, { verbose: true });
+      const response = await fetch(url, { verbose: true, tls });
       gc();
       const text = await response.text();
       gc();
@@ -491,8 +673,9 @@ describe("fetch", () => {
     });
   }
 
-  it('redirect: "manual"', async () => {
-    startServer({
+  it.concurrent('redirect: "manual"', async () => {
+    using server = Bun.serve({
+      port: 0,
       fetch(req) {
         return new Response(null, {
           status: 302,
@@ -507,30 +690,40 @@ describe("fetch", () => {
     });
     expect(response.status).toBe(302);
     expect(response.headers.get("location")).toBe("https://example.com");
-    expect(response.redirected).toBe(true);
+    expect(response.redirected).toBe(false); // not redirected
   });
 
-  it('redirect: "follow"', async () => {
-    startServer({
+  it.concurrent('redirect: "follow"', async () => {
+    using target = Bun.serve({
+      port: 0,
+      tls,
+      fetch() {
+        return new Response("redirected!");
+      },
+    });
+    using server = Bun.serve({
+      port: 0,
       fetch(req) {
         return new Response(null, {
           status: 302,
           headers: {
-            Location: "https://example.com",
+            Location: target.url.href,
           },
         });
       },
     });
     const response = await fetch(`http://${server.hostname}:${server.port}`, {
       redirect: "follow",
+      tls: { ca: tls.cert },
     });
     expect(response.status).toBe(200);
     expect(response.headers.get("location")).toBe(null);
     expect(response.redirected).toBe(true);
   });
 
-  it('redirect: "error" #2819', async () => {
-    startServer({
+  it.concurrent('redirect: "error" #2819', async () => {
+    using server = Bun.serve({
+      port: 0,
       fetch(req) {
         return new Response(null, {
           status: 302,
@@ -550,18 +743,12 @@ describe("fetch", () => {
     }
   });
 
-  it("should properly redirect to another port #7793", async () => {
-    var server: Server | null = null;
+  it.concurrent("should properly redirect to another port #7793", async () => {
     var socket: net.Server | null = null;
     try {
-      server = Bun.serve({
+      using server = Bun.serve({
         port: 0,
-        tls: {
-          "cert":
-            "-----BEGIN CERTIFICATE-----\nMIIDrzCCApegAwIBAgIUHaenuNcUAu0tjDZGpc7fK4EX78gwDQYJKoZIhvcNAQEL\nBQAwaTELMAkGA1UEBhMCVVMxCzAJBgNVBAgMAkNBMRYwFAYDVQQHDA1TYW4gRnJh\nbmNpc2NvMQ0wCwYDVQQKDARPdmVuMREwDwYDVQQLDAhUZWFtIEJ1bjETMBEGA1UE\nAwwKc2VydmVyLWJ1bjAeFw0yMzA5MDYyMzI3MzRaFw0yNTA5MDUyMzI3MzRaMGkx\nCzAJBgNVBAYTAlVTMQswCQYDVQQIDAJDQTEWMBQGA1UEBwwNU2FuIEZyYW5jaXNj\nbzENMAsGA1UECgwET3ZlbjERMA8GA1UECwwIVGVhbSBCdW4xEzARBgNVBAMMCnNl\ncnZlci1idW4wggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQC+7odzr3yI\nYewRNRGIubF5hzT7Bym2dDab4yhaKf5drL+rcA0J15BM8QJ9iSmL1ovg7x35Q2MB\nKw3rl/Yyy3aJS8whZTUze522El72iZbdNbS+oH6GxB2gcZB6hmUehPjHIUH4icwP\ndwVUeR6fB7vkfDddLXe0Tb4qsO1EK8H0mr5PiQSXfj39Yc1QHY7/gZ/xeSrt/6yn\n0oH9HbjF2XLSL2j6cQPKEayartHN0SwzwLi0eWSzcziVPSQV7c6Lg9UuIHbKlgOF\nzDpcp1p1lRqv2yrT25im/dS6oy9XX+p7EfZxqeqpXX2fr5WKxgnzxI3sW93PG8FU\nIDHtnUsoHX3RAgMBAAGjTzBNMCwGA1UdEQQlMCOCCWxvY2FsaG9zdIcEfwAAAYcQ\nAAAAAAAAAAAAAAAAAAAAATAdBgNVHQ4EFgQUF3y/su4J/8ScpK+rM2LwTct6EQow\nDQYJKoZIhvcNAQELBQADggEBAGWGWp59Bmrk3Gt0bidFLEbvlOgGPWCT9ZrJUjgc\nhY44E+/t4gIBdoKOSwxo1tjtz7WsC2IYReLTXh1vTsgEitk0Bf4y7P40+pBwwZwK\naeIF9+PC6ZoAkXGFRoyEalaPVQDBg/DPOMRG9OH0lKfen9OGkZxmmjRLJzbyfAhU\noI/hExIjV8vehcvaJXmkfybJDYOYkN4BCNqPQHNf87ZNdFCb9Zgxwp/Ou+47J5k4\n5plQ+K7trfKXG3ABMbOJXNt1b0sH8jnpAsyHY4DLEQqxKYADbXsr3YX/yy6c0eOo\nX2bHGD1+zGsb7lGyNyoZrCZ0233glrEM4UxmvldBcWwOWfk=\n-----END CERTIFICATE-----\n",
-          "key":
-            "-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQC+7odzr3yIYewR\nNRGIubF5hzT7Bym2dDab4yhaKf5drL+rcA0J15BM8QJ9iSmL1ovg7x35Q2MBKw3r\nl/Yyy3aJS8whZTUze522El72iZbdNbS+oH6GxB2gcZB6hmUehPjHIUH4icwPdwVU\neR6fB7vkfDddLXe0Tb4qsO1EK8H0mr5PiQSXfj39Yc1QHY7/gZ/xeSrt/6yn0oH9\nHbjF2XLSL2j6cQPKEayartHN0SwzwLi0eWSzcziVPSQV7c6Lg9UuIHbKlgOFzDpc\np1p1lRqv2yrT25im/dS6oy9XX+p7EfZxqeqpXX2fr5WKxgnzxI3sW93PG8FUIDHt\nnUsoHX3RAgMBAAECggEAAckMqkn+ER3c7YMsKRLc5bUE9ELe+ftUwfA6G+oXVorn\nE+uWCXGdNqI+TOZkQpurQBWn9IzTwv19QY+H740cxo0ozZVSPE4v4czIilv9XlVw\n3YCNa2uMxeqp76WMbz1xEhaFEgn6ASTVf3hxYJYKM0ljhPX8Vb8wWwlLONxr4w4X\nOnQAB5QE7i7LVRsQIpWKnGsALePeQjzhzUZDhz0UnTyGU6GfC+V+hN3RkC34A8oK\njR3/Wsjahev0Rpb+9Pbu3SgTrZTtQ+srlRrEsDG0wVqxkIk9ueSMOHlEtQ7zYZsk\nlX59Bb8LHNGQD5o+H1EDaC6OCsgzUAAJtDRZsPiZEQKBgQDs+YtVsc9RDMoC0x2y\nlVnP6IUDXt+2UXndZfJI3YS+wsfxiEkgK7G3AhjgB+C+DKEJzptVxP+212hHnXgr\n1gfW/x4g7OWBu4IxFmZ2J/Ojor+prhHJdCvD0VqnMzauzqLTe92aexiexXQGm+WW\nwRl3YZLmkft3rzs3ZPhc1G2X9QKBgQDOQq3rrxcvxSYaDZAb+6B/H7ZE4natMCiz\nLx/cWT8n+/CrJI2v3kDfdPl9yyXIOGrsqFgR3uhiUJnz+oeZFFHfYpslb8KvimHx\nKI+qcVDcprmYyXj2Lrf3fvj4pKorc+8TgOBDUpXIFhFDyM+0DmHLfq+7UqvjU9Hs\nkjER7baQ7QKBgQDTh508jU/FxWi9RL4Jnw9gaunwrEt9bxUc79dp+3J25V+c1k6Q\nDPDBr3mM4PtYKeXF30sBMKwiBf3rj0CpwI+W9ntqYIwtVbdNIfWsGtV8h9YWHG98\nJ9q5HLOS9EAnogPuS27walj7wL1k+NvjydJ1of+DGWQi3aQ6OkMIegap0QKBgBlR\nzCHLa5A8plG6an9U4z3Xubs5BZJ6//QHC+Uzu3IAFmob4Zy+Lr5/kITlpCyw6EdG\n3xDKiUJQXKW7kluzR92hMCRnVMHRvfYpoYEtydxcRxo/WS73SzQBjTSQmicdYzLE\ntkLtZ1+ZfeMRSpXy0gR198KKAnm0d2eQBqAJy0h9AoGBAM80zkd+LehBKq87Zoh7\ndtREVWslRD1C5HvFcAxYxBybcKzVpL89jIRGKB8SoZkF7edzhqvVzAMP0FFsEgCh\naClYGtO+uo+B91+5v2CCqowRJUGfbFOtCuSPR7+B3LDK8pkjK2SQ0mFPUfRA5z0z\nNVWtC0EYNBTRkqhYtqr3ZpUc\n-----END PRIVATE KEY-----\n",
-        },
+        tls,
         fetch() {
           return new Response("Hello, world!");
         },
@@ -577,20 +764,24 @@ describe("fetch", () => {
       const { promise, resolve, reject } = Promise.withResolvers();
       socket.on("error", reject);
       socket.listen(0, "localhost", async () => {
-        await fetch(`http://localhost:${socket?.address()?.port}/`, { tls: { rejectUnauthorized: false } });
-        const response = await fetch(server?.url, { tls: { rejectUnauthorized: false } }).then(res => res.text());
+        const url = server?.url.href;
+        const http_url = server?.url.href.replace("https://", "http://");
+        try {
+          await fetch(http_url, { tls: { rejectUnauthorized: false } });
+        } catch {}
+        const response = await fetch(url, { tls: { rejectUnauthorized: false } }).then(res => res.text());
         resolve(response);
       });
 
       expect(await promise).toBe("Hello, world!");
     } finally {
-      server?.stop(true);
       socket?.close();
     }
   });
 
-  it("provide body", async () => {
-    startServer({
+  it.concurrent("provide body", async () => {
+    using server = Bun.serve({
+      port: 0,
       fetch(req) {
         return new Response(req.body);
       },
@@ -604,17 +795,40 @@ describe("fetch", () => {
     expect(await response.text()).toBe("buntastic");
   });
 
-  ["GET", "HEAD", "OPTIONS"].forEach(method =>
-    it(`fail on ${method} with body`, async () => {
-      const url = `http://${server.hostname}:${server.port}`;
+  ["GET", "HEAD", "TRACE"].forEach(method =>
+    it.concurrent(`fail on ${method} with body`, async () => {
+      // The request is rejected before any network I/O, so the URL is irrelevant.
       expect(async () => {
-        await fetch(url, { body: "buntastic" });
-      }).toThrow("fetch() request with GET/HEAD/OPTIONS method cannot have body.");
+        await fetch("http://example.invalid/", { method, body: "buntastic" });
+      }).toThrow("fetch() request with GET/HEAD method cannot have body.");
     }),
   );
 
-  it("content length is inferred", async () => {
-    startServer({
+  // WHATWG Fetch only forbids a body for GET and HEAD. OPTIONS with content is
+  // legal HTTP (RFC 9110 §9.3.7) and must be sent, not rejected.
+  it.concurrent("OPTIONS with body is sent and delivered", async () => {
+    using server = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        return Response.json({
+          method: req.method,
+          cl: req.headers.get("content-length"),
+          body: await req.text(),
+        });
+      },
+    });
+    const res = await fetch(server.url, {
+      method: "OPTIONS",
+      body: "PAYLOAD",
+      headers: { "content-type": "text/plain" },
+    });
+    expect(await res.json()).toEqual({ method: "OPTIONS", cl: "7", body: "PAYLOAD" });
+    expect(res.status).toBe(200);
+  });
+
+  it.concurrent("content length is inferred", async () => {
+    using server = Bun.serve({
+      port: 0,
       fetch(req) {
         return new Response(req.headers.get("content-length"));
       },
@@ -632,14 +846,13 @@ describe("fetch", () => {
     expect(await response2.text()).toBe("0");
   });
 
-  it("should work with ipv6 localhost", async () => {
-    const server = Bun.serve({
+  it.concurrent("should work with ipv6 localhost", async () => {
+    using server = Bun.serve({
       port: 0,
       fetch(req) {
         return new Response("Pass!");
       },
     });
-
     let res = await fetch(`http://[::1]:${server.port}`);
     expect(await res.text()).toBe("Pass!");
     res = await fetch(`http://[::]:${server.port}/`);
@@ -648,17 +861,15 @@ describe("fetch", () => {
     expect(await res.text()).toBe("Pass!");
     res = await fetch(`http://[0000:0000:0000:0000:0000:0000:0000:0001]:${server.port}/`);
     expect(await res.text()).toBe("Pass!");
-
-    server.stop();
   });
 });
 
-it("simultaneous HTTPS fetch", async () => {
-  const urls = ["https://example.com", "https://www.example.com"];
+it.concurrent("simultaneous HTTPS fetch", async () => {
+  const urls = [httpsServer.url.href, httpsServer.url.href];
   for (let batch = 0; batch < 4; batch++) {
     const promises = new Array(20);
     for (let i = 0; i < 20; i++) {
-      promises[i] = fetch(urls[i % 2]);
+      promises[i] = fetch(urls[i % 2], { tls: { ca: httpsServer.ca } });
     }
     const result = await Promise.all(promises);
     expect(result.length).toBe(20);
@@ -669,9 +880,16 @@ it("simultaneous HTTPS fetch", async () => {
   }
 });
 
-it("website with tlsextname", async () => {
-  // irony
-  await fetch("https://bun.sh", { method: "HEAD" });
+it.concurrent("website with tlsextname", async () => {
+  using server = Bun.serve({
+    port: 0,
+    tls,
+    fetch() {
+      return new Response("OK");
+    },
+  });
+  const resp = await fetch(server.url, { method: "HEAD", tls: { ca: tls.cert } });
+  expect(resp.status).toBe(200);
 });
 
 function testBlobInterface(blobbyConstructor: { (..._: any[]): any }, hasBlobFn?: boolean) {
@@ -682,23 +900,27 @@ function testBlobInterface(blobbyConstructor: { (..._: any[]): any }, hasBlobFn?
         hello: "😀 😃 😄 😁 😆 😅 😂 🤣 🥲 ☺️ 😊 😇 🙂 🙃 😉 😌 😍 🥰 😘 😗 😙 😚 😋 😛 😝 😜 🤪 🤨 🧐 🤓 😎 🥸 🤩 🥳",
       },
     ]) {
-      it(`${jsonObject.hello === true ? "latin1" : "utf16"} json${withGC ? " (with gc) " : ""}`, async () => {
-        if (withGC) gc();
-        var response = blobbyConstructor(JSON.stringify(jsonObject));
-        if (withGC) gc();
-        expect(JSON.stringify(await response.json())).toBe(JSON.stringify(jsonObject));
-        if (withGC) gc();
-      });
+      it.concurrent(
+        `${jsonObject.hello === true ? "latin1" : "utf16"} json${withGC ? " (with gc) " : ""}`,
+        async () => {
+          if (withGC) gc();
+          var response = blobbyConstructor(JSON.stringify(jsonObject));
+          if (withGC) gc();
+          expect(JSON.stringify(await response.json())).toBe(JSON.stringify(jsonObject));
+          if (withGC) gc();
+        },
+      );
 
-      it(`${jsonObject.hello === true ? "latin1" : "utf16"} arrayBuffer -> json${
-        withGC ? " (with gc) " : ""
-      }`, async () => {
-        if (withGC) gc();
-        var response = blobbyConstructor(new TextEncoder().encode(JSON.stringify(jsonObject)));
-        if (withGC) gc();
-        expect(JSON.stringify(await response.json())).toBe(JSON.stringify(jsonObject));
-        if (withGC) gc();
-      });
+      it.concurrent(
+        `${jsonObject.hello === true ? "latin1" : "utf16"} arrayBuffer -> json${withGC ? " (with gc) " : ""}`,
+        async () => {
+          if (withGC) gc();
+          var response = blobbyConstructor(new TextEncoder().encode(JSON.stringify(jsonObject)));
+          if (withGC) gc();
+          expect(JSON.stringify(await response.json())).toBe(JSON.stringify(jsonObject));
+          if (withGC) gc();
+        },
+      );
 
       it(`${jsonObject.hello === true ? "latin1" : "utf16"} arrayBuffer -> invalid json${
         withGC ? " (with gc) " : ""
@@ -759,6 +981,29 @@ function testBlobInterface(blobbyConstructor: { (..._: any[]): any }, hasBlobFn?
         if (withGC) gc();
       });
 
+      it(`${jsonObject.hello === true ? "latin1" : "utf16"} bytes${withGC ? " (with gc) " : ""}`, async () => {
+        if (withGC) gc();
+
+        var response = blobbyConstructor(JSON.stringify(jsonObject));
+        if (withGC) gc();
+
+        const bytes = new TextEncoder().encode(JSON.stringify(jsonObject));
+        if (withGC) gc();
+
+        const compare = await response.bytes();
+        if (withGC) gc();
+
+        withoutAggressiveGC(() => {
+          for (let i = 0; i < compare.length; i++) {
+            if (withGC) gc();
+
+            expect(compare[i]).toBe(bytes[i]);
+            if (withGC) gc();
+          }
+        });
+        if (withGC) gc();
+      });
+
       it(`${jsonObject.hello === true ? "latin1" : "utf16"} arrayBuffer -> arrayBuffer${
         withGC ? " (with gc) " : ""
       }`, async () => {
@@ -771,6 +1016,31 @@ function testBlobInterface(blobbyConstructor: { (..._: any[]): any }, hasBlobFn?
         if (withGC) gc();
 
         const compare = new Uint8Array(await response.arrayBuffer());
+        if (withGC) gc();
+
+        withoutAggressiveGC(() => {
+          for (let i = 0; i < compare.length; i++) {
+            if (withGC) gc();
+
+            expect(compare[i]).toBe(bytes[i]);
+            if (withGC) gc();
+          }
+        });
+        if (withGC) gc();
+      });
+
+      it(`${jsonObject.hello === true ? "latin1" : "utf16"} arrayBuffer -> bytes${
+        withGC ? " (with gc) " : ""
+      }`, async () => {
+        if (withGC) gc();
+
+        var response = blobbyConstructor(new TextEncoder().encode(JSON.stringify(jsonObject)));
+        if (withGC) gc();
+
+        const bytes = new TextEncoder().encode(JSON.stringify(jsonObject));
+        if (withGC) gc();
+
+        const compare = await response.bytes();
         if (withGC) gc();
 
         withoutAggressiveGC(() => {
@@ -805,10 +1075,10 @@ function testBlobInterface(blobbyConstructor: { (..._: any[]): any }, hasBlobFn?
           await new Promise(resolve => setTimeout(resolve, 1));
           if (withGC) gc();
           expect(out).toBe(text);
-          const first = await blobed.arrayBuffer();
+          const first = new Uint8Array(await blobed.arrayBuffer());
           const initial = first[0];
           first[0] = 254;
-          const second = await blobed.arrayBuffer();
+          const second = new Uint8Array(await blobed.arrayBuffer());
           expect(second[0]).toBe(initial);
           expect(first[0]).toBe(254);
         });
@@ -816,13 +1086,13 @@ function testBlobInterface(blobbyConstructor: { (..._: any[]): any }, hasBlobFn?
   }
 }
 
-describe("Bun.file", () => {
+describe.concurrent("Bun.file", () => {
   let count = 0;
   testBlobInterface(data => {
     const blob = new Blob([data]);
     const buffer = Bun.peek(blob.arrayBuffer()) as ArrayBuffer;
     const path = join(tmp_dir, `tmp-${count++}.bytes`);
-    writeFileSync(path, buffer);
+    writeFileSync(path, buffer as any);
     const file = Bun.file(path);
     expect(blob.size).toBe(file.size);
     expect(file.lastModified).toBeGreaterThan(0);
@@ -837,15 +1107,16 @@ describe("Bun.file", () => {
     expect(size).toBe(Infinity);
   });
 
-  const method = ["arrayBuffer", "text", "json"] as const;
+  const method = ["arrayBuffer", "text", "json", "bytes"] as const;
   function forEachMethod(fn: (m: (typeof method)[number]) => any, skip?: AnyFunction) {
     for (const m of method) {
       (skip ? it.skip : it)(m, fn(m));
     }
   }
 
-  // on Windows the creator of the file will be able to read from it so this test is disabled on it
-  describe.skipIf(isWindows)("bad permissions throws", () => {
+  // on Windows the creator of the file will be able to read from it so this test is disabled on it;
+  // root can read it anywhere, so it is disabled there as well
+  describe.skipIf(isWindows || isRoot)("bad permissions throws", () => {
     const path = join(tmp_dir, "my-new-file");
     beforeAll(async () => {
       await Bun.write(path, "hey");
@@ -854,7 +1125,7 @@ describe("Bun.file", () => {
 
     forEachMethod(m => () => {
       const file = Bun.file(path);
-      expect(async () => await file[m]()).toThrow("Permission denied");
+      expect(async () => await file[m]()).toThrow("permission denied");
     });
 
     afterAll(() => {
@@ -867,7 +1138,7 @@ describe("Bun.file", () => {
 
     forEachMethod(m => async () => {
       const file = Bun.file(path);
-      expect(async () => await file[m]()).toThrow("No such file or directory");
+      expect(async () => await file[m]()).toThrow("no such file or directory");
     });
   });
 });
@@ -1056,19 +1327,45 @@ describe("Response", () => {
       expect(response.headers.get("x-hello")).toBe("world");
       expect(response.status).toBe(408);
     });
+
+    it("throws TypeError for non-JSON serializable top-level values (Node.js compatibility)", () => {
+      // Symbol, Function, and undefined should throw "Value is not JSON serializable"
+      expect(() => Response.json(Symbol("test"))).toThrow("Value is not JSON serializable");
+      expect(() => Response.json(function () {})).toThrow("Value is not JSON serializable");
+      expect(() => Response.json(undefined)).toThrow("Value is not JSON serializable");
+
+      // These should not throw (valid values)
+      expect(() => Response.json(null)).not.toThrow();
+      expect(() => Response.json({})).not.toThrow();
+      expect(() => Response.json("string")).not.toThrow();
+      expect(() => Response.json(123)).not.toThrow();
+      expect(() => Response.json(true)).not.toThrow();
+      expect(() => Response.json([1, 2, 3])).not.toThrow();
+
+      // Objects containing non-serializable values should not throw at top-level
+      // (they get filtered out by JSON.stringify)
+      expect(() => Response.json({ symbol: Symbol("test") })).not.toThrow();
+      expect(() => Response.json({ func: function () {} })).not.toThrow();
+      expect(() => Response.json({ undef: undefined })).not.toThrow();
+
+      // BigInt should throw with Node.js compatible error message
+      expect(() => Response.json(123n)).toThrow("Do not know how to serialize a BigInt");
+    });
   });
   describe("Response.redirect", () => {
     it("works", () => {
+      // Location is the serialization of the parsed url, so an empty path
+      // gains a trailing "/". https://fetch.spec.whatwg.org/#dom-response-redirect
       const inputs = [
-        "http://example.com",
-        "http://example.com/",
-        "http://example.com/hello",
-        "http://example.com/hello/",
-        "http://example.com/hello/world",
-        "http://example.com/hello/world/",
+        ["http://example.com", "http://example.com/"],
+        ["http://example.com/", "http://example.com/"],
+        ["http://example.com/hello", "http://example.com/hello"],
+        ["http://example.com/hello/", "http://example.com/hello/"],
+        ["http://example.com/hello/world", "http://example.com/hello/world"],
+        ["http://example.com/hello/world/", "http://example.com/hello/world/"],
       ];
-      for (let input of inputs) {
-        expect(Response.redirect(input).headers.get("Location")).toBe(input);
+      for (const [input, expected] of inputs) {
+        expect(Response.redirect(input).headers.get("Location")).toBe(expected);
       }
     });
 
@@ -1079,11 +1376,11 @@ describe("Response", () => {
           "x-hello": "world",
           Location: "https://wrong.com",
         },
-        status: 408,
+        status: 307,
       });
       expect(response.headers.get("x-hello")).toBe("world");
-      expect(response.headers.get("Location")).toBe("https://example.com");
-      expect(response.status).toBe(302);
+      expect(response.headers.get("Location")).toBe("https://example.com/");
+      expect(response.status).toBe(307);
       expect(response.type).toBe("default");
       expect(response.ok).toBe(false);
     });
@@ -1131,7 +1428,11 @@ describe("Response", () => {
   describe("should consume body correctly", async () => {
     it("with text first", async () => {
       var response = new Response("<div>hello</div>");
-      expect(await response.text()).toBe("<div>hello</div>");
+      expect(response.bodyUsed).toBe(false);
+      const promise = response.text();
+      expect(response.bodyUsed).toBe(true);
+      expect(await promise).toBe("<div>hello</div>");
+      expect(response.bodyUsed).toBe(true);
       expect(async () => {
         await response.text();
       }).toThrow("Body already used");
@@ -1150,7 +1451,11 @@ describe("Response", () => {
     });
     it("with json first", async () => {
       var response = new Response('{ "hello": "world" }');
-      expect(await response.json()).toEqual({ "hello": "world" });
+      expect(response.bodyUsed).toBe(false);
+      const promise = response.json();
+      expect(response.bodyUsed).toBe(true);
+      expect(await promise).toEqual({ "hello": "world" });
+      expect(response.bodyUsed).toBe(true);
       expect(async () => {
         await response.json();
       }).toThrow("Body already used");
@@ -1173,7 +1478,11 @@ describe("Response", () => {
           "content-type": "multipart/form-data;boundary=boundary",
         },
       });
-      expect(await response.formData()).toBeInstanceOf(FormData);
+      expect(response.bodyUsed).toBe(false);
+      const promise = response.formData();
+      expect(response.bodyUsed).toBe(true);
+      expect(await promise).toBeInstanceOf(FormData);
+      expect(response.bodyUsed).toBe(true);
       expect(async () => {
         await response.formData();
       }).toThrow("Body already used");
@@ -1192,14 +1501,16 @@ describe("Response", () => {
     });
     it("with blob first", async () => {
       var response = new Response("<div>hello</div>");
-      expect(response.body instanceof ReadableStream).toBe(true);
-      expect(response.headers instanceof Headers).toBe(true);
-      expect(response.type).toBe("default");
-      var blob = await response.blob();
-      expect(blob).toBeInstanceOf(Blob);
-      expect(blob.stream()).toBeInstanceOf(ReadableStream);
+      expect(response.bodyUsed).toBe(false);
+      const promise = response.blob();
+      expect(response.bodyUsed).toBe(true);
+      expect(await promise).toBeInstanceOf(Blob);
+      expect(response.bodyUsed).toBe(true);
       expect(async () => {
         await response.blob();
+      }).toThrow("Body already used");
+      expect(async () => {
+        await response.bytes();
       }).toThrow("Body already used");
       expect(async () => {
         await response.text();
@@ -1216,7 +1527,11 @@ describe("Response", () => {
     });
     it("with arrayBuffer first", async () => {
       var response = new Response("<div>hello</div>");
-      expect(await response.arrayBuffer()).toBeInstanceOf(ArrayBuffer);
+      expect(response.bodyUsed).toBe(false);
+      const promise = response.arrayBuffer();
+      expect(response.bodyUsed).toBe(true);
+      expect(await promise).toBeInstanceOf(ArrayBuffer);
+      expect(response.bodyUsed).toBe(true);
       expect(async () => {
         await response.arrayBuffer();
       }).toThrow("Body already used");
@@ -1255,20 +1570,27 @@ describe("Response", () => {
         method: "POST",
         body: await Bun.file(import.meta.dir + "/fixtures/file.txt").arrayBuffer(),
       });
-      var input = await response.arrayBuffer();
+      const input = await response.bytes();
       var output = await Bun.file(import.meta.dir + "/fixtures/file.txt").stream();
-      expect(new Uint8Array(input)).toEqual((await output.getReader().read()).value);
+      let chunks: Uint8Array[] = [];
+      const reader = output.getReader();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+      }
+      expect(input).toEqual(Buffer.concat(chunks));
     });
   });
 
   it("should work with bigint", () => {
-    var r = new Response("hello status", { status: 200n });
+    var r = new Response("hello status", { status: 200n as any });
     expect(r.status).toBe(200);
-    r = new Response("hello status", { status: 599n });
+    r = new Response("hello status", { status: 599n as any });
     expect(r.status).toBe(599);
-    r = new Response("hello status", { status: BigInt(200) });
+    r = new Response("hello status", { status: BigInt(200) as any });
     expect(r.status).toBe(200);
-    r = new Response("hello status", { status: BigInt(599) });
+    r = new Response("hello status", { status: BigInt(599) as any });
     expect(r.status).toBe(599);
   });
   testBlobInterface(data => new Response(data), true);
@@ -1401,12 +1723,11 @@ it("Request({}) throws", async () => {
 it("Request({toString() { throw 'wat'; } }) throws", async () => {
   expect(
     () =>
-      // @ts-expect-error
       new Request({
         toString() {
           throw "wat";
         },
-      }),
+      } as any),
   ).toThrow("wat");
 });
 
@@ -1472,6 +1793,196 @@ it("fetch() file:// works", async () => {
   expect(fileResponseText).toEqual(bunFileText);
   gc(true);
 });
+it("fetch() file:// rejects a host that is not this machine", async () => {
+  const path = Bun.fileURLToPath(new URL("fixture.html", import.meta.url));
+  const expected = await Bun.file(path).text();
+  const pathname = new URL(import.meta.url).pathname.replace(/[^/]*$/, "fixture.html");
+  const outcome = (url: string) =>
+    fetch(url).then(
+      r => r.text(),
+      e => `${e.name} ${e.code}: ${e.message}`,
+    );
+  expect(await outcome(`file://${pathname}`)).toBe(expected);
+  expect(await outcome(`file://localhost${pathname}`)).toBe(expected);
+  expect(await outcome(`file://LOCALHOST${pathname}`)).toBe(expected);
+  const rejected =
+    `TypeError ERR_INVALID_FILE_URL_HOST: File URL host must be "localhost" or empty` +
+    (isWindows ? ": fetch() does not read UNC paths" : ` on ${process.platform}`);
+  expect(await outcome(`file://any.host${pathname}`)).toBe(rejected);
+  expect(await outcome(`file://127.0.0.1${pathname}`)).toBe(rejected);
+  // fileURLToPath's other rule: an encoded separator would become a real one.
+  const encoded =
+    "TypeError ERR_INVALID_FILE_URL_PATH: File URL path must not include encoded " +
+    (isWindows ? "\\ or / characters" : "/ characters");
+  expect(await outcome(`file://${pathname.replace(/\/([^/]*)$/, "%2F$1")}`)).toBe(encoded);
+  expect(await outcome(`file://${pathname.replace(/\/([^/]*)$/, "/sub/..%2f$1")}`)).toBe(encoded);
+});
+
+it("fetch() file:// rejects a path with an encoded NUL", async () => {
+  using dir = tempDir("fetch-file-nul", { "note.txt": "NOTE-TXT" });
+  const url = Bun.pathToFileURL(join(String(dir), "note.txt")).href;
+  await using proc = Bun.spawn({
+    cmd: [
+      bunExe(),
+      "-e",
+      `for (const url of process.argv.slice(1)) {
+        const outcome = fetch(url).then(
+          async r => r.status + " " + (await r.text()),
+          e => e.name + " " + e.code + ": " + e.message,
+        );
+        console.log(await outcome);
+      }`,
+      url,
+      url + "%00.png",
+      url + "%00",
+    ],
+    env: bunEnv,
+    stdout: "pipe",
+    stderr: "inherit",
+  });
+  const [stdout, exitCode] = await Promise.all([proc.stdout.text(), proc.exited]);
+  // Bun.file(url) and node:fs report the same error for this URL.
+  const rejected = (suffix: string) =>
+    "TypeError ERR_INVALID_ARG_VALUE: The argument 'path' must be a string, Uint8Array, or URL without null bytes. " +
+    `Received ${JSON.stringify(decodeURIComponent(new URL(url).pathname) + suffix)}`;
+  expect(stdout.split("\n")).toEqual(["200 NOTE-TXT", rejected("\0.png"), rejected("\0"), ""]);
+  expect(exitCode).toBe(0);
+});
+
+it("proxy: true is rejected, since it names no proxy", async () => {
+  expect(await fetch("http://example.invalid/", { proxy: true } as any).catch(e => e.code)).toBe(
+    "ERR_INVALID_ARG_TYPE",
+  );
+  expect(() => new Bun.FetchSession({ proxy: true } as any)).toThrow(
+    'The "proxy" argument must be a string, a URL, an object with a "url", or false. Received type boolean (true)',
+  );
+});
+
+it("URL userinfo is sent as Basic credentials unless an Authorization header is given", async () => {
+  const seen: Record<string, string | null> = {};
+  using server = Bun.serve({
+    port: 0,
+    fetch(req) {
+      seen[new URL(req.url).pathname] = req.headers.get("authorization");
+      return new Response(req.url);
+    },
+  });
+  const base = `localhost:${server.port}`;
+  const urls = await Promise.all(
+    [
+      fetch(`http://user:p%40ss@${base}/a`),
+      fetch(`http://user@${base}/b`),
+      fetch(new Request(`http://user:pass@${base}/c`)),
+      fetch(`http://user:pass@${base}/d`, { headers: { authorization: "Bearer explicit" } }),
+      fetch(`http://${base}/e`),
+    ].map(p => p.then(r => r.text())),
+  );
+  // The request line and Host never carry the userinfo.
+  expect(urls).toEqual(["a", "b", "c", "d", "e"].map(p => `http://${base}/${p}`));
+  expect(seen).toEqual({
+    "/a": `Basic ${btoa("user:p@ss")}`,
+    "/b": `Basic ${btoa("user:")}`,
+    "/c": `Basic ${btoa("user:pass")}`,
+    "/d": "Bearer explicit",
+    "/e": null,
+  });
+});
+
+it("URL userinfo does not displace the Content-Type a body brings", async () => {
+  using server = Bun.serve({
+    port: 0,
+    async fetch(req) {
+      const form = await req.formData();
+      return Response.json({ authorization: req.headers.get("authorization"), field: form.get("field") });
+    },
+  });
+  const body = new FormData();
+  body.set("field", "value");
+  const response = await fetch(`http://user:pass@localhost:${server.port}/`, { method: "POST", body });
+  expect(await response.json()).toEqual({ authorization: `Basic ${btoa("user:pass")}`, field: "value" });
+});
+
+it("URL credentials are not forwarded on a cross-origin redirect", async () => {
+  const seen: (string | null)[] = [];
+  using target = Bun.serve({
+    port: 0,
+    fetch(req) {
+      seen.push(req.headers.get("authorization"));
+      return new Response("target");
+    },
+  });
+  using origin = Bun.serve({
+    port: 0,
+    fetch(req) {
+      seen.push(req.headers.get("authorization"));
+      return Response.redirect(`http://localhost:${target.port}/`, 302);
+    },
+  });
+  expect(await (await fetch(`http://user:pass@localhost:${origin.port}/`)).text()).toBe("target");
+  expect(seen).toEqual([`Basic ${btoa("user:pass")}`, null]);
+});
+
+it("URL credentials survive a same-origin redirect whose Location leaves them out", async () => {
+  const seen: [string, string | null][] = [];
+  using server = Bun.serve({
+    port: 0,
+    fetch(req) {
+      const { pathname } = new URL(req.url);
+      seen.push([pathname, req.headers.get("authorization")]);
+      return pathname === "/a" ? Response.redirect(`http://localhost:${server.port}/b`, 302) : new Response("b");
+    },
+  });
+  expect(await (await fetch(`http://user:pass@localhost:${server.port}/a`)).text()).toBe("b");
+  const basic = `Basic ${btoa("user:pass")}`;
+  expect(seen).toEqual([
+    ["/a", basic],
+    ["/b", basic],
+  ]);
+});
+
+it("connection failures reject with an errno-style code that the message starts with", async () => {
+  using dead = await deadPort();
+  const refused = await fetch(`http://127.0.0.1:${dead.port}/`).catch(e => e);
+  expect({ name: refused.name, code: refused.code, message: refused.message }).toEqual({
+    name: "TypeError",
+    code: "ECONNREFUSED",
+    message: "ECONNREFUSED: Unable to connect. Is the computer able to access the url?",
+  });
+
+  // A name with several addresses, none of which accepts: the path Windows reports differently.
+  const viaName = await fetch(`http://localhost:${dead.port}/`).catch(e => e);
+  expect(viaName.code).toBe("ECONNREFUSED");
+  // The URL an error names does not carry the URL's credentials.
+  const withUserinfo = await fetch(`http://user:secret@127.0.0.1:${dead.port}/x`).catch(e => e);
+  expect(withUserinfo.path).toBe(`http://127.0.0.1:${dead.port}/x`);
+
+  const resetter = net.createServer(socket => socket.once("data", () => socket.destroy()));
+  resetter.listen(0, "127.0.0.1");
+  await once(resetter, "listening");
+  try {
+    const reset = await fetch(`http://127.0.0.1:${(resetter.address() as net.AddressInfo).port}/`, {
+      method: "POST",
+      body: "not retried",
+    }).catch(e => e);
+    expect({ name: reset.name, code: reset.code, message: reset.message }).toEqual({
+      name: "TypeError",
+      code: "ECONNRESET",
+      message:
+        "ECONNRESET: The socket connection was closed unexpectedly. For more information, pass `verbose: true` in the second argument to fetch()",
+    });
+  } finally {
+    resetter.close();
+  }
+
+  using looping = Bun.serve({ port: 0, fetch: req => Response.redirect(req.url, 302) });
+  const tooMany = await fetch(looping.url, { maxRedirects: 2 }).catch(e => e);
+  expect({ code: tooMany.code, message: tooMany.message }).toEqual({
+    code: "TooManyRedirects",
+    message:
+      "TooManyRedirects: The response redirected too many times. For more information, pass `verbose: true` in the second argument to fetch()",
+  });
+});
+
 it("cloned response headers are independent before accessing", () => {
   const response = new Response("hello", {
     headers: {
@@ -1559,7 +2070,7 @@ it("should work with http 100 continue on the same buffer", async () => {
 
 describe("should strip headers", () => {
   it("status code 303", async () => {
-    const server = Bun.serve({
+    using server = Bun.serve({
       port: 0,
       async fetch(request: Request) {
         if (request.url.endsWith("/redirect")) {
@@ -1590,11 +2101,10 @@ describe("should strip headers", () => {
     expect(headers.get("Content-Language")).toBeNull();
     expect(url).toEndWith("/redirected");
     expect(redirected).toBe(true);
-    server.stop(true);
   });
 
   it("cross-origin status code 302", async () => {
-    const server1 = Bun.serve({
+    await using server1 = Bun.serve({
       port: 0,
       async fetch(request: Request) {
         if (request.url.endsWith("/redirect")) {
@@ -1613,7 +2123,7 @@ describe("should strip headers", () => {
       },
     });
 
-    const server2 = Bun.serve({
+    await using server2 = Bun.serve({
       port: 0,
       async fetch(request: Request, server) {
         if (request.url.endsWith("/redirect")) {
@@ -1631,24 +2141,25 @@ describe("should strip headers", () => {
         });
       },
     });
-
     const { headers, url, redirected } = await fetch(`http://${server1.hostname}:${server1.port}/redirect`, {
       method: "GET",
       headers: {
         "Authorization": "yes",
+        "Proxy-Authorization": "yes",
+        "Cookie": "yes",
       },
     });
 
     expect(headers.get("Authorization")).toBeNull();
+    expect(headers.get("Proxy-Authorization")).toBeNull();
+    expect(headers.get("Cookie")).toBeNull();
     expect(url).toEndWith("/redirected");
     expect(redirected).toBe(true);
-    server1.stop(true);
-    server2.stop(true);
   });
 });
 
 it("same-origin status code 302 should not strip headers", async () => {
-  const server = Bun.serve({
+  using server = Bun.serve({
     port: 0,
     async fetch(request: Request, server) {
       if (request.url.endsWith("/redirect")) {
@@ -1671,17 +2182,20 @@ it("same-origin status code 302 should not strip headers", async () => {
     method: "GET",
     headers: {
       "Authorization": "yes",
+      "Proxy-Authorization": "yes",
+      "Cookie": "yes",
     },
   });
 
   expect(headers.get("Authorization")).toEqual("yes");
+  expect(headers.get("Proxy-Authorization")).toEqual("yes");
+  expect(headers.get("Cookie")).toEqual("yes");
   expect(url).toEndWith("/redirected");
   expect(redirected).toBe(true);
-  server.stop(true);
 });
 
 describe("should handle relative location in the redirect, issue#5635", () => {
-  var server: Server;
+  let server: Server<undefined>;
   beforeAll(async () => {
     server = Bun.serve({
       port: 0,
@@ -1740,9 +2254,49 @@ describe("should handle relative location in the redirect, issue#5635", () => {
   });
 });
 
-it("should allow very long redirect URLS", async () => {
+describe("maxRedirects", () => {
+  let server: Server<undefined>;
+  beforeAll(() => {
+    server = Bun.serve({
+      port: 0,
+      async fetch(request: Request) {
+        const url = new URL(request.url);
+        if (url.pathname.startsWith("/hop/")) {
+          const hop = Number(url.pathname.slice("/hop/".length));
+          if (hop >= 4) {
+            return new Response("done");
+          }
+          return new Response(null, { status: 302, headers: { Location: `/hop/${hop + 1}` } });
+        }
+        return new Response("Not Found", { status: 404 });
+      },
+    });
+  });
+  afterAll(() => {
+    server.stop(true);
+  });
+
+  it("rejects once the chain exceeds maxRedirects", async () => {
+    expect(fetch(`${server.url}hop/0`, { maxRedirects: 2 })).rejects.toThrow("redirected too many times");
+  });
+
+  it("follows the chain when maxRedirects is large enough", async () => {
+    const resp = await fetch(`${server.url}hop/0`, { maxRedirects: 4 });
+    expect(resp.status).toBe(200);
+    expect(await resp.text()).toBe("done");
+    expect(new URL(resp.url).pathname).toBe("/hop/4");
+  });
+
+  it("rejects invalid values", async () => {
+    expect(async () => await fetch(`${server.url}hop/0`, { maxRedirects: -1 })).toThrow();
+    expect(async () => await fetch(`${server.url}hop/0`, { maxRedirects: 1.5 })).toThrow();
+    expect(async () => await fetch(`${server.url}hop/0`, { maxRedirects: NaN })).toThrow();
+  });
+});
+
+it.concurrent("should allow very long redirect URLS", async () => {
   const Location = "/" + "B".repeat(7 * 1024);
-  const server = Bun.serve({
+  using server = Bun.serve({
     port: 0,
     async fetch(request: Request) {
       gc();
@@ -1766,10 +2320,9 @@ it("should allow very long redirect URLS", async () => {
     expect(url).toBe(`${server.url.origin}${Location}`);
     expect(status).toBe(404);
   }
-  server.stop(true);
 });
 
-it("304 not modified with missing content-length does not cause a request timeout", async () => {
+it.concurrent("304 not modified with missing content-length does not cause a request timeout", async () => {
   const server = await Bun.listen({
     socket: {
       open(socket) {
@@ -1918,7 +2471,7 @@ describe("http/1.1 response body length", () => {
     it("should read json until socket closed", async () => {
       const response = await fetch(`http://${getHost()}/json`);
       expect(response.status).toBe(200);
-      expect(response.json<unknown>()).resolves.toEqual({ "hello": "World" });
+      expect(response.json()).resolves.toEqual({ "hello": "World" });
     });
 
     it("should disable keep-alive", async () => {
@@ -1956,9 +2509,1784 @@ describe("http/1.1 response body length", () => {
     expect(response.arrayBuffer()).resolves.toHaveLength(0);
   });
 
-  it("should ignore body on HEAD", async () => {
+  it.todoIf(isBroken)("should ignore body on HEAD", async () => {
     const response = await fetch(`http://${getHost()}/text`, { method: "HEAD" });
     expect(response.status).toBe(200);
     expect(response.arrayBuffer()).resolves.toHaveLength(0);
   });
+});
+describe("fetch Response life cycle", () => {
+  // error: Malformed_HTTP_Response fetching "http://localhost:58888/". For more information, pass `verbose: true` in the second argument to fetch()
+  //   path: "http://localhost:58888/",
+  //  errno: 0,
+  //   code: "Malformed_HTTP_Response"
+  // 2054 |       stderr: "inherit",
+  // 2055 |       stdout: "inherit",
+  // 2056 |       stdin: "inherit",
+  // 2057 |       env: bunEnv,
+  // 2058 |     });
+  // 2059 |     expect(await clientProcess.exited).toBe(0);
+  //                                               ^
+  // error: expect(received).toBe(expected)
+  // Expected: 0
+  // Received: 1
+  //       at <anonymous> (/opt/homebrew/etc/buildkite-agent/builds/macOS-13-aarch64-1/bun/bun/test/js/web/fetch/fetch.test.ts:2059:40)
+  // ✗ fetch Response life cycle > should not keep Response alive if not consumed [205.17ms]
+  it.skipIf(isFlaky && isMacOS)("should not keep Response alive if not consumed", async () => {
+    let deferred = Promise.withResolvers<string>();
+
+    await using serverProcess = Bun.spawn({
+      cmd: [bunExe(), "--smol", fetchFixture3],
+      stderr: "inherit",
+      stdout: "inherit",
+      stdin: "inherit",
+      env: bunEnv,
+      ipc(message) {
+        deferred.resolve(message);
+      },
+    });
+
+    const serverUrl = await deferred.promise;
+    await using clientProcess = Bun.spawn({
+      cmd: [bunExe(), "--smol", fetchFixture4, serverUrl],
+      stderr: "inherit",
+      stdout: "inherit",
+      stdin: "inherit",
+      env: bunEnv,
+    });
+    expect(await clientProcess.exited).toBe(0);
+  });
+  it("should allow to get promise result after response is GC'd", async () => {
+    using server = Bun.serve({
+      port: 0,
+      async fetch(request: Request) {
+        return new Response(
+          new ReadableStream({
+            async pull(controller) {
+              await Bun.sleep(100);
+              controller.enqueue(new TextEncoder().encode("Hello, World!"));
+              await Bun.sleep(100);
+              controller.close();
+            },
+          }),
+          { status: 200 },
+        );
+      },
+    });
+    async function fetchResponse() {
+      const url = new URL("non-empty", server.url);
+      const response = await fetch(url);
+      return response.text();
+    }
+    try {
+      const response_promise = fetchResponse();
+      Bun.gc(true);
+      expect(await response_promise).toBe("Hello, World!");
+    } finally {
+      server.stop(true);
+    }
+  });
+});
+
+describe("fetch should allow duplex", () => {
+  it("should allow duplex streaming", async () => {
+    using server = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        return new Response(req.body);
+      },
+    });
+    const intervalStream = new ReadableStream({
+      start(c) {
+        let count = 0;
+        const timer = setInterval(() => {
+          c.enqueue("Hello\n");
+          if (count === 5) {
+            clearInterval(timer);
+            c.close();
+          }
+          count++;
+        }, 20);
+      },
+    }).pipeThrough(new TextEncoderStream());
+
+    const resp = await fetch(server.url, {
+      method: "POST",
+      body: intervalStream,
+      duplex: "half",
+    });
+
+    const reader = resp.body!.pipeThrough(new TextDecoderStream()).getReader();
+    var result = "";
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      result += value;
+    }
+    expect(result).toBe("Hello\n".repeat(6));
+  });
+
+  it("should allow duplex extending Readable (sync)", async () => {
+    class HelloWorldStream extends Readable {
+      declare chunks: string[];
+      declare index: number;
+      constructor(options?) {
+        super(options);
+        this.chunks = ["Hello", " ", "World!"];
+        this.index = 0;
+      }
+
+      _read(size) {
+        if (this.index < this.chunks.length) {
+          this.push(this.chunks[this.index]);
+          this.index++;
+        } else {
+          this.push(null);
+        }
+      }
+    }
+
+    using server = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        return new Response(req.body);
+      },
+    });
+    const response = await fetch(server.url, {
+      body: new HelloWorldStream(),
+      method: "POST",
+      duplex: "half",
+    });
+
+    expect(await response.text()).toBe("Hello World!");
+  });
+  it("should allow duplex extending Readable (async)", async () => {
+    class HelloWorldStream extends Readable {
+      declare chunks: string[];
+      declare index: number;
+      constructor(options?) {
+        super(options);
+        this.chunks = ["Hello", " ", "World!"];
+        this.index = 0;
+      }
+
+      _read(size) {
+        setTimeout(() => {
+          if (this.index < this.chunks.length) {
+            this.push(this.chunks[this.index]);
+            this.index++;
+          } else {
+            this.push(null);
+          }
+        }, 20);
+      }
+    }
+
+    using server = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        return new Response(req.body);
+      },
+    });
+    const response = await fetch(server.url, {
+      body: new HelloWorldStream(),
+      method: "POST",
+      duplex: "half",
+    });
+
+    expect(await response.text()).toBe("Hello World!");
+  });
+
+  // A node Readable whose _read() pushes synchronously produces an async iterator whose
+  // .next() fulfills synchronously; the request-body sink must report backpressure so the
+  // pump suspends on flush(true) instead of spinning.
+  it("does not wedge on Readable.destroy() when _read pushes synchronously", async () => {
+    const fixture = `
+      const net = require("node:net");
+      const { Readable } = require("node:stream");
+      const srv = net.createServer(s => s.on("data", () => {}));
+      await new Promise(r => srv.listen(0, "127.0.0.1", r));
+      const chunk = Buffer.alloc(16 * 1024, 0x47);
+      const rd = new Readable({ read() { this.push(chunk); } });
+      setTimeout(() => rd.destroy(new Error("upstream went away")), 50);
+      let ticks = 0;
+      const iv = setInterval(() => { ticks++ }, 25);
+      try {
+        await fetch("http://127.0.0.1:" + srv.address().port + "/", { method: "POST", body: rd, duplex: "half" });
+        console.log("BUG: fetch resolved");
+      } catch (e) {
+        console.log("rejected:" + String(e?.message || e) + " ticks:" + ticks);
+      }
+      clearInterval(iv);
+      srv.close();
+      process.exit(0);
+    `;
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "-e", fixture],
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "inherit",
+    });
+    const stdoutP = proc.stdout.text();
+    // The failure mode is a 100%-CPU spin that never yields, so proc.exited alone cannot
+    // resolve on an unfixed build; the race is the condition, not a timing crutch.
+    const exited = await Promise.race([proc.exited, sleep(isDebug ? 4000 : 2000).then(() => "timeout" as const)]);
+    if (exited === "timeout") proc.kill(9);
+    const stdout = await stdoutP;
+    expect({ exited, stdout: stdout.trim() }).toEqual({
+      exited: 0,
+      stdout: expect.stringMatching(/^rejected:upstream went away ticks:[1-9]/),
+    });
+  });
+
+  it("should allow duplex using async iterator (async)", async () => {
+    using server = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        return new Response(req.body);
+      },
+    });
+    const response = await fetch(server.url, {
+      body: async function* iter() {
+        yield "Hello";
+        await Bun.sleep(20);
+        yield " ";
+        await Bun.sleep(20);
+        yield "World!";
+      },
+      method: "POST",
+      duplex: "half",
+    });
+
+    expect(await response.text()).toBe("Hello World!");
+  });
+
+  it("should fail in redirects .follow when using duplex", async () => {
+    using server = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        if (req.url.indexOf("/redirect") === -1) {
+          return Response.redirect("/");
+        }
+        return new Response(req.body);
+      },
+    });
+
+    await expect(async () => {
+      const response = await fetch(server.url, {
+        body: async function* iter() {
+          yield "Hello";
+          await Bun.sleep(20);
+          yield " ";
+          await Bun.sleep(20);
+          yield "World!";
+        },
+        method: "POST",
+        duplex: "half",
+      });
+
+      await response.text();
+    }).toThrow();
+  });
+
+  it("should work in redirects .manual when using duplex", async () => {
+    using server = Bun.serve({
+      port: 0,
+      idleTimeout: 0,
+      async fetch(req) {
+        if (req.url.indexOf("/redirect") === -1) {
+          return Response.redirect("/");
+        }
+        return new Response(req.body);
+      },
+    });
+
+    await expect(async () => {
+      const response = await fetch(server.url, {
+        body: async function* iter() {
+          yield "Hello";
+          await Bun.sleep(20);
+          yield " ";
+          await Bun.sleep(20);
+          yield "World!";
+        },
+        method: "POST",
+        duplex: "half",
+        redirect: "manual",
+      });
+
+      await response.text();
+    }).not.toThrow();
+  });
+
+  // When the download source is faster than the upload target, the response-
+  // body ByteStream must pause the source socket instead of buffering the
+  // rate difference in-process. Before the fix, a chunk arriving before the
+  // upload sink attached flipped the source to BufferAll and RSS grew at the
+  // line rate (several GB in seconds on localhost).
+  it("bounds memory when the upload target is slower than the download source", async () => {
+    const fixture = `
+      const net = require("node:net");
+      const chunk = Buffer.alloc(64 * 1024, 0x47);
+      const source = net.createServer(sock => {
+        sock.write("HTTP/1.1 200 OK\\r\\ntransfer-encoding: chunked\\r\\nconnection: close\\r\\n\\r\\n");
+        const framed = Buffer.concat([Buffer.from("10000\\r\\n"), chunk, Buffer.from("\\r\\n")]);
+        const pump = () => { while (sock.write(framed)); sock.once("drain", pump); }; pump();
+      });
+      // Sink reads ~1 MB/s so the source (line rate on loopback) outpaces it.
+      const sink = net.createServer(sock => {
+        let seen = 0; const start = Date.now(); const RATE = 1024 * 1024;
+        sock.on("data", d => {
+          seen += d.length;
+          const ahead = (seen / RATE) * 1000 - (Date.now() - start);
+          if (ahead > 0) { sock.pause(); setTimeout(() => sock.resume(), ahead); }
+        });
+      });
+      await Promise.all([source, sink].map(s => new Promise(r => s.listen(0, "127.0.0.1", r))));
+
+      Bun.gc(true);
+      const rssBefore = process.memoryUsage.rss();
+      const up = await fetch(\`http://127.0.0.1:\${source.address().port}/\`);
+      fetch(\`http://127.0.0.1:\${sink.address().port}/\`, { method: "POST", body: up.body, duplex: "half" }).catch(() => {});
+
+      let peak = rssBefore;
+      for (let i = 0; i < 20; i++) {
+        await Bun.sleep(100);
+        peak = Math.max(peak, process.memoryUsage.rss());
+      }
+      console.log(JSON.stringify({ deltaMB: (peak - rssBefore) / 1024 / 1024 }));
+      process.exit(0);
+    `;
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "-e", fixture],
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect(stderr).toBe("");
+    const { deltaMB } = JSON.parse(stdout.trim());
+    // Without the fix RSS grows by hundreds of MB per second; with it, the
+    // in-flight bytes are bounded by kernel socket buffers plus one chunk.
+    expect(deltaMB).toBeLessThan(isASAN || isDebug ? 160 : 64);
+    expect(exitCode).toBe(0);
+  });
+
+  // A type:"direct" stream body where pull does `await controller.write(chunk)`
+  // in a loop must suspend when the sink is backpressured: write() returns a
+  // pending Promise once the stream buffer is over the high-water mark.
+  it("suspends a type:'direct' body's controller.write() when the upload target is backpressured", async () => {
+    const fixture = `
+      const net = require("node:net");
+      const sink = net.createServer(sock => sock.pause());
+      await new Promise(r => sink.listen(0, "127.0.0.1", r));
+
+      Bun.gc(true);
+      const rssBefore = process.memoryUsage.rss();
+      let writes = 0, suspended = false;
+      const body = new ReadableStream({
+        type: "direct",
+        async pull(controller) {
+          const chunk = new Uint8Array(64 * 1024).fill(0x47);
+          while (writes < 4096) {
+            const wrote = controller.write(chunk);
+            writes++;
+            if (wrote instanceof Promise) { suspended = true; await wrote; }
+            else await 1;
+          }
+        },
+      });
+      fetch(\`http://127.0.0.1:\${sink.address().port}/\`, { method: "POST", body, duplex: "half" }).catch(() => {});
+
+      let peak = rssBefore;
+      for (let i = 0; i < 15; i++) {
+        await Bun.sleep(100);
+        peak = Math.max(peak, process.memoryUsage.rss());
+      }
+      console.log(JSON.stringify({ deltaMB: (peak - rssBefore) / 1024 / 1024, writes, suspended }));
+      process.exit(0);
+    `;
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "-e", fixture],
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect(stderr).toBe("");
+    const { deltaMB, writes, suspended } = JSON.parse(stdout.trim());
+    expect(suspended).toBe(true);
+    // Without the fix the loop is unbounded (tens of GB before harness kill);
+    // with it, writes stop once the kernel send buffer fills.
+    expect(deltaMB).toBeLessThan(isASAN || isDebug ? 96 : 32);
+    expect(writes).toBeLessThan(256);
+    expect(exitCode).toBe(0);
+  });
+
+  // Passing a response body as a request body attaches it to a native sink;
+  // the source stream must be marked locked + disturbed so a second consumer
+  // errors instead of hanging on data that will never be delivered to it.
+  it("locks the response body when it is used as a request body", async () => {
+    await using source = Bun.serve({
+      port: 0,
+      fetch: () => new Response(new ReadableStream({ pull: c => c.enqueue(new Uint8Array(64 * 1024)) })),
+    });
+    const streaming = Promise.withResolvers<void>();
+    const gate = Promise.withResolvers<void>();
+    await using sink = Bun.serve({
+      port: 0,
+      fetch: async req => {
+        // Body bytes arriving here proves the client has attached the
+        // source stream to its request-body sink (headers alone do not).
+        await req.body!.getReader().read();
+        streaming.resolve();
+        await gate.promise;
+        return new Response("ok");
+      },
+    });
+
+    const up = await fetch(source.url);
+    const controller = new AbortController();
+    const upload = fetch(sink.url, {
+      method: "POST",
+      body: up.body,
+      duplex: "half",
+      signal: controller.signal,
+    } as RequestInit).catch(() => {});
+
+    await streaming.promise;
+    expect(up.body!.locked).toBe(true);
+    expect(up.bodyUsed).toBe(true);
+    expect(() => up.body!.getReader()).toThrow(expect.objectContaining({ code: "ERR_INVALID_STATE" }));
+
+    gate.resolve();
+    controller.abort();
+    await upload;
+  });
+
+  // A Bun.serve handler forwarding req.body to a slower upload target must
+  // back-pressure the uploading client rather than buffering the difference:
+  // the request-body ByteStream stops reading from the inbound socket while
+  // the outbound sink is over its high-water mark.
+  it("bounds memory when a handler forwards req.body to a stalled target", async () => {
+    const fixture = `
+      const net = require("node:net");
+      const CHUNK = Buffer.alloc(64 * 1024, 0x47), COUNT = 2048; // 128 MB
+      // Upload target stalls before reading, then drains and reports the total.
+      const { promise: drained, resolve: onDrained } = Promise.withResolvers();
+      const sink = net.createServer(sock => {
+        let got = 0;
+        sock.pause();
+        setTimeout(() => sock.resume(), 500);
+        sock.on("data", d => { got += d.length; if (got >= CHUNK.length * COUNT) onDrained(got); });
+      });
+      await new Promise(r => sink.listen(0, "127.0.0.1", r));
+
+      const proxy = Bun.serve({
+        port: 0,
+        idleTimeout: 0,
+        maxRequestBodySize: 512 * 1024 * 1024,
+        async fetch(req) {
+          await fetch(\`http://127.0.0.1:\${sink.address().port}/\`, { method: "POST", body: req.body, duplex: "half" }).catch(() => {});
+          return new Response("ok");
+        },
+      });
+
+      // Client uploads exactly COUNT chunks as fast as its socket accepts.
+      const client = net.connect(proxy.port, "127.0.0.1", () => {
+        client.write("POST / HTTP/1.1\\r\\nHost: x\\r\\nTransfer-Encoding: chunked\\r\\n\\r\\n");
+        const framed = Buffer.concat([Buffer.from("10000\\r\\n"), CHUNK, Buffer.from("\\r\\n")]);
+        let n = 0;
+        const pump = () => { while (n < COUNT) { n++; if (!client.write(framed)) return client.once("drain", pump); } client.write("0\\r\\n\\r\\n"); };
+        pump();
+      });
+      client.on("error", () => {});
+
+      console.log(JSON.stringify({ drained: (await drained) >= CHUNK.length * COUNT }));
+      process.exit(0);
+    `;
+    const [fixtureMaxRSS, baselineMaxRSS] = await Promise.all([
+      runFixtureMaxRSS(fixture, { drained: true }),
+      emptyProcessMaxRSS(),
+    ]);
+    // Without inbound back-pressure the proxy absorbs the whole payload while
+    // the target stalls; with it the uploader's socket fills instead.
+    expect((fixtureMaxRSS - baselineMaxRSS) / 1024 / 1024).toBeLessThan(isASAN || isDebug ? 256 : 96);
+  });
+});
+
+it("should allow to follow redirect if connection is closed, abort should work even if the socket was closed before the redirect", async () => {
+  for (const type of ["normal", "delay"]) {
+    await using server = net.createServer(socket => {
+      // Raw test server: tolerate client aborts, surface anything unexpected.
+      socket.on("error", (err: NodeJS.ErrnoException) => {
+        if (err.code !== "ECONNRESET" && err.code !== "EPIPE" && err.code !== "ECONNABORTED") throw err;
+      });
+      let body = "";
+      socket.on("data", data => {
+        body += data.toString("utf8");
+
+        const headerEndIndex = body.indexOf("\r\n\r\n");
+        if (headerEndIndex !== -1) {
+          // headers received
+          const headers = body.split("\r\n\r\n")[0];
+          const path = headers.split("\r\n")[0].split(" ")[1];
+          if (path === "/redirect") {
+            socket.end(
+              "HTTP/1.1 308 Permanent Redirect\r\nCache-Control: public, max-age=0, must-revalidate\r\nContent-Type: text/plain\r\nLocation: /\r\nConnection: close\r\n\r\n",
+            );
+          } else {
+            if (type === "delay") {
+              setTimeout(() => {
+                if (!socket.destroyed)
+                  socket.end(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 9\r\nConnection: close\r\n\r\nHello Bun",
+                  );
+              }, 200);
+            } else {
+              socket.end(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 9\r\nConnection: close\r\n\r\nHello Bun",
+              );
+            }
+          }
+        }
+      });
+    });
+    await once(server.listen(0), "listening");
+
+    try {
+      let { address, port } = server.address() as AddressInfo;
+      if (address === "::") {
+        address = "[::]";
+      }
+      const response = await fetch(`http://${address}:${port}/redirect`, {
+        signal: AbortSignal.timeout(150),
+      });
+      if (type === "delay") {
+        console.error(response, type);
+        expect.unreachable();
+      } else {
+        expect(response.status).toBe(200);
+        expect(await response.text()).toBe("Hello Bun");
+      }
+    } catch (err) {
+      if (type === "delay") {
+        expect((err as Error).name).toBe("TimeoutError");
+      } else {
+        expect.unreachable();
+      }
+    }
+  }
+});
+
+it("rejects a response with an unparseable Content-Length instead of treating it as empty", async () => {
+  // RFC 9112 section 6.3: an invalid Content-Length (or duplicate Content-Length
+  // headers with differing values) is an unrecoverable framing error. Falling
+  // back to "0" would deliver an empty body and return a desynchronized socket
+  // to the keep-alive pool with the unread response bytes still in flight,
+  // where they would be read as the response to the next request.
+  await using server = net.createServer(socket => {
+    socket.once("data", data => {
+      const path = data.toString("utf8").split(" ")[1];
+      if (path === "/invalid") {
+        socket.end(
+          "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: x\r\nConnection: keep-alive\r\n\r\n" +
+            "HTTP/1.1 200 OK\r\nContent-Length: 25\r\n\r\ninjected follow-up bytes!",
+        );
+      } else if (path === "/conflicting") {
+        socket.end(
+          "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello!",
+        );
+      } else {
+        socket.end(
+          "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+        );
+      }
+    });
+  });
+  await once(server.listen(0, "localhost"), "listening");
+  const { port } = server.address() as AddressInfo;
+
+  for (const path of ["invalid", "conflicting"]) {
+    const result = await fetch(`http://localhost:${port}/${path}`)
+      .then(res => res.text())
+      .catch(e => e);
+    expect(result).toBeInstanceOf(Error);
+    expect((result as any).code).toBe("InvalidContentLength");
+  }
+
+  // A well-formed Content-Length is still delivered normally.
+  const ok = await fetch(`http://localhost:${port}/valid`);
+  expect(await ok.text()).toBe("hello");
+});
+
+it("never sends the URL fragment in the request-target", async () => {
+  // The request-target is `new URL(s).pathname + search`. A fragment is never
+  // sent, even one that contains a `?`.
+  const targets: string[] = [];
+  await using server = net.createServer(socket => {
+    socket.once("data", data => {
+      targets.push(data.toString("utf8").split("\r\n")[0]);
+      socket.end("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+    });
+  });
+  await once(server.listen(0, "localhost"), "listening");
+  const { port } = server.address() as AddressInfo;
+
+  const tails = [
+    "/p#frag?x=1",
+    "/p#/route?id=7",
+    "/#?",
+    "/cb#access_token=abc&scope=x?y",
+    "/p?q=1#frag?x=2",
+    "/p#plain",
+    "/a//b?q=1#/c?d",
+  ];
+  const expected: string[] = [];
+  for (const tail of tails) {
+    const href = `http://localhost:${port}${tail}`;
+    const url = new URL(href);
+    expected.push(`GET ${url.pathname}${url.search} HTTP/1.1`);
+    await (await fetch(href)).text();
+  }
+  expect(targets).toEqual(expected);
+});
+
+it("combines duplicate response headers per the Fetch spec", async () => {
+  // WHATWG Fetch requires repeated header fields to be combined with ", " when
+  // read via Headers.get(), except Set-Cookie which is stored as separate
+  // values exposed by getSetCookie(). Previously Bun overwrote duplicate
+  // non-common header names with the last value, dropping earlier values.
+  await using server = net.createServer(socket => {
+    socket.once("data", () => {
+      socket.end(
+        "HTTP/1.1 200 OK\r\n" +
+          "Content-Length: 2\r\n" +
+          "X-Dup: first\r\n" +
+          "X-Dup: second\r\n" +
+          "X-Dup: third\r\n" +
+          "X-Once: only\r\n" +
+          "X-Gap: a\r\n" +
+          "X-Gap:\r\n" +
+          "X-Gap: c\r\n" +
+          "X-Empty:\r\n" +
+          "Accept: text/html\r\n" +
+          "Accept: application/json\r\n" +
+          "Set-Cookie: a=1\r\n" +
+          "Set-Cookie: b=2\r\n" +
+          "Connection: close\r\n" +
+          "\r\n" +
+          "ok",
+      );
+    });
+  });
+  await once(server.listen(0, "127.0.0.1"), "listening");
+  const { port } = server.address() as AddressInfo;
+
+  const res = await fetch(`http://127.0.0.1:${port}/`);
+  expect(await res.text()).toBe("ok");
+  expect(res.headers.get("x-dup")).toBe("first, second, third");
+  expect(res.headers.get("x-once")).toBe("only");
+  // the combine step has no empty-value exception, and a lone empty header is
+  // still visible — undici returns "a, , c" and "" here, not "a, c" and null
+  expect(res.headers.get("x-gap")).toBe("a, , c");
+  expect(res.headers.get("x-empty")).toBe("");
+  expect(res.headers.get("accept")).toBe("text/html, application/json");
+  expect(res.headers.getSetCookie()).toEqual(["a=1", "b=2"]);
+});
+
+it("drops a custom Host header when following a cross-origin redirect", async () => {
+  // A per-request Host override must not survive a change of origin: the
+  // follow-up request's Host header has to be re-computed from the redirect
+  // target's URL, not carried over from the previous origin.
+  await using target = Bun.serve({
+    port: 0,
+    async fetch(request) {
+      return new Response(request.headers.get("host") ?? "<no host header>");
+    },
+  });
+
+  await using origin = Bun.serve({
+    port: 0,
+    async fetch(request) {
+      if (new URL(request.url).pathname === "/redirect") {
+        return new Response(null, {
+          status: 302,
+          headers: { "Location": `http://${target.hostname}:${target.port}/landed` },
+        });
+      }
+      return new Response(request.headers.get("host") ?? "<no host header>");
+    },
+  });
+
+  // Cross-origin redirect: the redirect target must see its own authority,
+  // not the caller-supplied Host override naming the previous origin.
+  const redirected = await fetch(`http://${origin.hostname}:${origin.port}/redirect`, {
+    headers: { "Host": "tenant.shared-cdn.example" },
+  });
+  expect(redirected.redirected).toBe(true);
+  expect(await redirected.text()).toBe(`${target.hostname}:${target.port}`);
+
+  // Without a redirect the explicit Host header is still honored.
+  const direct = await fetch(`http://${origin.hostname}:${origin.port}/direct`, {
+    headers: { "Host": "tenant.shared-cdn.example" },
+  });
+  expect(await direct.text()).toBe("tenant.shared-cdn.example");
+});
+
+it("fetch() with a fixed-size body drops a caller-supplied Transfer-Encoding header and sends only Content-Length", async () => {
+  // RFC 9112 section 6.2/6.3: a sender must never emit both Transfer-Encoding and
+  // Content-Length on the same message. For a fixed-size (non-streaming) body,
+  // fetch() writes the body as raw bytes framed by a computed Content-Length, so a
+  // caller-supplied "Transfer-Encoding: chunked" header (e.g. headers copied wholesale
+  // from an inbound request in a gateway) must be dropped rather than forwarded
+  // alongside Content-Length, where a TE-preferring upstream would mis-frame the body.
+  const requests: string[] = [];
+  await using server = net.createServer(socket => {
+    let raw = "";
+    socket.on("data", data => {
+      raw += data.toString("latin1");
+      const headerEnd = raw.indexOf("\r\n\r\n");
+      if (headerEnd === -1) return;
+      const head = raw.slice(0, headerEnd);
+      const contentLength = Number(/^content-length:\s*(\d+)\s*$/im.exec(head)?.[1] ?? 0);
+      if (raw.length < headerEnd + 4 + contentLength) return;
+      requests.push(raw);
+      raw = "";
+      socket.end("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK");
+    });
+  });
+  await once(server.listen(0, "localhost"), "listening");
+  const { port } = server.address() as AddressInfo;
+
+  // A body whose raw bytes look like a terminal chunk followed by a second request.
+  const body = "0\r\n\r\nGET /other HTTP/1.1\r\nHost: upstream\r\nX-Pad: junk";
+  const bodyLength = Buffer.byteLength(body);
+
+  // Caller-supplied Transfer-Encoding header alongside a buffered (string) body.
+  const withTE = await fetch(`http://localhost:${port}/`, {
+    method: "POST",
+    headers: { "Transfer-Encoding": "chunked", "Content-Type": "text/plain" },
+    body,
+  });
+  expect(await withTE.text()).toBe("OK");
+
+  // The same request without the header still works the same way.
+  const plain = await fetch(`http://localhost:${port}/`, {
+    method: "POST",
+    headers: { "Content-Type": "text/plain" },
+    body,
+  });
+  expect(await plain.text()).toBe("OK");
+
+  expect(requests).toHaveLength(2);
+  for (const rawRequest of requests) {
+    const [head, ...bodyParts] = rawRequest.split("\r\n\r\n");
+    const headerLines = head
+      .split("\r\n")
+      .slice(1)
+      .map(line => line.toLowerCase());
+    // Exactly one framing header reaches the wire: the computed Content-Length.
+    expect(headerLines.filter(line => line.startsWith("transfer-encoding:"))).toEqual([]);
+    expect(headerLines.filter(line => line.startsWith("content-length:"))).toEqual([`content-length: ${bodyLength}`]);
+    // The body is the raw bytes described by Content-Length, with no chunk framing added.
+    expect(bodyParts.join("\r\n\r\n")).toBe(body);
+  }
+});
+
+it("fetch() does not forward a caller-supplied Content-Length on a request without a body", async () => {
+  // The Content-Length emitted on the wire must always describe the body fetch() is
+  // actually about to send. A Content-Length copied from an inbound request (e.g. by a
+  // gateway forwarding headers wholesale) on a request with no body would make the
+  // upstream wait for body bytes that never arrive and read the start of the next
+  // request on a kept-alive connection as that body.
+  const requests: string[] = [];
+  await using server = net.createServer(socket => {
+    let raw = "";
+    socket.on("data", data => {
+      raw += data.toString("latin1");
+      const headerEnd = raw.indexOf("\r\n\r\n");
+      if (headerEnd === -1) return;
+      const head = raw.slice(0, headerEnd);
+      const method = head.split(" ")[0];
+      if (method !== "GET") {
+        // wait for the declared body before replying
+        const contentLength = Number(/^content-length:\s*(\d+)\s*$/im.exec(head)?.[1] ?? 0);
+        if (raw.length < headerEnd + 4 + contentLength) return;
+      }
+      requests.push(raw);
+      raw = "";
+      socket.end("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK");
+    });
+  });
+  await once(server.listen(0, "localhost"), "listening");
+  const { port } = server.address() as AddressInfo;
+
+  // GET request with no body: a caller-supplied Content-Length must not reach the wire.
+  const bodyless = await fetch(`http://localhost:${port}/`, {
+    headers: { "Content-Length": "52", "X-Custom": "still-forwarded" },
+  });
+  expect(await bodyless.text()).toBe("OK");
+
+  // POST request with a real body: the emitted Content-Length is computed from the
+  // body, not taken from the caller-supplied header.
+  const withBody = await fetch(`http://localhost:${port}/`, {
+    method: "POST",
+    headers: { "Content-Length": "999" },
+    body: "hi",
+  });
+  expect(await withBody.text()).toBe("OK");
+
+  expect(requests).toHaveLength(2);
+  const headerLinesOf = (request: string) =>
+    request
+      .split("\r\n\r\n")[0]
+      .split("\r\n")
+      .slice(1)
+      .map(line => line.toLowerCase());
+
+  const bodylessHeaders = headerLinesOf(requests[0]);
+  // No Content-Length at all on the bodyless request: the bogus value is dropped.
+  expect(bodylessHeaders.filter(line => line.startsWith("content-length:"))).toEqual([]);
+  // Other caller-supplied headers are still forwarded.
+  expect(bodylessHeaders).toContain("x-custom: still-forwarded");
+
+  const withBodyHeaders = headerLinesOf(requests[1]);
+  expect(withBodyHeaders.filter(line => line.startsWith("content-length:"))).toEqual(["content-length: 2"]);
+});
+
+describe("fetch() with a streaming request body and caller framing headers", () => {
+  // fetch() cannot measure a ReadableStream, an async generator or a node
+  // stream.Readable body. It sends such a body in one of two ways: raw bytes
+  // behind a Content-Length the caller declared, or chunk-encoded bytes behind a
+  // Transfer-Encoding that ends in "chunked". A caller header that asks for
+  // anything else describes framing fetch() does not produce, so the fetch
+  // rejects before a byte is written. A declared Content-Length must match the
+  // body: a surplus byte would land on the connection after the declared end,
+  // where a keep-alive peer reads it as the start of the next request, and a
+  // missing byte leaves the peer waiting for a body that never completes.
+  type RawRequest = { framing: string[]; body: string };
+
+  // A raw origin that records, per connection, the framing header lines exactly
+  // as written and the body bytes exactly as received.
+  async function rawOrigin() {
+    const queue: RawRequest[] = [];
+    const waiting: ((request: RawRequest) => void)[] = [];
+    let connections = 0;
+    const record = (raw: string) => {
+      const headerEnd = raw.indexOf("\r\n\r\n");
+      const request: RawRequest = {
+        framing: raw
+          .slice(0, headerEnd === -1 ? raw.length : headerEnd)
+          .split("\r\n")
+          .filter(line => /^(content-length|transfer-encoding):/i.test(line)),
+        body: headerEnd === -1 ? "" : raw.slice(headerEnd + 4),
+      };
+      const resolve = waiting.shift();
+      if (resolve) resolve(request);
+      else queue.push(request);
+    };
+    const server = net.createServer(socket => {
+      connections++;
+      let raw = "";
+      let replied = false;
+      socket.on("error", () => {});
+      // The client resets a connection whose body does not match its
+      // Content-Length, so the close is the only signal that the request is
+      // over. Record whatever arrived.
+      socket.on("close", () => {
+        if (!replied) record(raw);
+      });
+      socket.on("data", data => {
+        raw += data.toString("latin1");
+        const headerEnd = raw.indexOf("\r\n\r\n");
+        if (headerEnd === -1 || replied) return;
+        const head = raw.slice(0, headerEnd);
+        const received = raw.slice(headerEnd + 4);
+        if (/^transfer-encoding:.*chunked\s*$/im.test(head)) {
+          if (!received.endsWith("0\r\n\r\n")) return;
+        } else {
+          const declared = Number(/^content-length:\s*(\d+)\s*$/im.exec(head)?.[1] ?? 0);
+          if (received.length < declared) return;
+        }
+        replied = true;
+        record(raw);
+        socket.end("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK");
+      });
+    });
+    await once(server.listen(0, "localhost"), "listening");
+    return {
+      url: `http://localhost:${(server.address() as AddressInfo).port}/`,
+      nextRequest: () =>
+        queue.length > 0 ? Promise.resolve(queue.shift()!) : new Promise<RawRequest>(resolve => waiting.push(resolve)),
+      get connections() {
+        return connections;
+      },
+      [Symbol.asyncDispose]: () => server[Symbol.asyncDispose](),
+    };
+  }
+
+  const body = "nr1-nr2"; // 7 bytes
+  const chunked = `${body.length.toString(16)}\r\n${body}\r\n0\r\n\r\n`;
+  const bodyKinds: [string, () => unknown][] = [
+    [
+      "ReadableStream",
+      () =>
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(body));
+            controller.close();
+          },
+        }),
+    ],
+    [
+      "async generator",
+      async function* () {
+        yield body;
+      },
+    ],
+    ["stream.Readable", () => Readable.from([body])],
+  ];
+  const post = (url: string, headers: Bun.HeadersInit, makeBody: () => unknown) =>
+    fetch(url, { method: "POST", headers, body: makeBody(), duplex: "half" } as RequestInit);
+  // The response text, or what the fetch rejected with.
+  const outcome = (response: Promise<Response>) =>
+    response.then(
+      r => r.text(),
+      e => ({ name: e?.name, code: e?.code }),
+    );
+  const invalidHeader = { name: "TypeError", code: "ERR_HTTP_INVALID_HEADER_VALUE" };
+  const mismatch = { name: "Error", code: "ERR_HTTP_CONTENT_LENGTH_MISMATCH" };
+
+  describe.each(bodyKinds)("%s body", (_, makeBody) => {
+    it("sends the raw bytes behind a Content-Length that matches them", async () => {
+      await using origin = await rawOrigin();
+      expect(await outcome(post(origin.url, { "Content-Length": String(body.length) }, makeBody))).toBe("OK");
+      expect(await origin.nextRequest()).toEqual({ framing: ["Content-Length: 7"], body });
+    });
+
+    it("fails the request when the body does not match its Content-Length", async () => {
+      await using origin = await rawOrigin();
+      // Longer than declared: no byte of the surplus chunk is written, so
+      // nothing can be read as the start of the next request.
+      expect(await outcome(post(origin.url, { "Content-Length": "2" }, makeBody))).toEqual(mismatch);
+      expect((await origin.nextRequest()).body).toBe("");
+      // Shorter than declared: the request fails instead of leaving the peer
+      // waiting for 43 bytes that never come. The peer sees the connection reset
+      // mid-message. How much it read before the reset is up to its TCP stack.
+      expect(await outcome(post(origin.url, { "Content-Length": "50" }, makeBody))).toEqual(mismatch);
+      expect((await origin.nextRequest()).body.length).toBeLessThanOrEqual(body.length);
+      // The next request gets a connection of its own.
+      expect(await outcome(post(origin.url, {}, makeBody))).toBe("OK");
+      expect(await origin.nextRequest()).toEqual({ framing: ["Transfer-Encoding: chunked"], body: chunked });
+    });
+
+    it("forwards a Transfer-Encoding whose final coding is chunked, as written", async () => {
+      await using origin = await rawOrigin();
+      for (const value of ["chunked", "Chunked", "gzip, chunked"]) {
+        expect(await outcome(post(origin.url, { "Transfer-Encoding": value }, makeBody))).toBe("OK");
+        expect(await origin.nextRequest()).toEqual({ framing: [`Transfer-Encoding: ${value}`], body: chunked });
+      }
+      // Two caller rows reach the client joined, like any list header.
+      const joined = new Headers();
+      joined.append("Transfer-Encoding", "gzip");
+      joined.append("Transfer-Encoding", "chunked");
+      expect(await outcome(post(origin.url, joined, makeBody))).toBe("OK");
+      expect(await origin.nextRequest()).toEqual({ framing: ["Transfer-Encoding: gzip, chunked"], body: chunked });
+      // A Content-Length next to it is neither sent nor counted.
+      for (const contentLength of [String(body.length), "2"]) {
+        const headers = { "Transfer-Encoding": "chunked", "Content-Length": contentLength };
+        expect(await outcome(post(origin.url, headers, makeBody))).toBe("OK");
+        expect(await origin.nextRequest()).toEqual({ framing: ["Transfer-Encoding: chunked"], body: chunked });
+      }
+    });
+
+    it("rejects a Content-Length that is not a count of bytes, before anything is sent", async () => {
+      await using origin = await rawOrigin();
+      const twoRows = new Headers();
+      twoRows.append("Content-Length", "5");
+      twoRows.append("Content-Length", "7");
+      const rows: Bun.HeadersInit[] = [
+        ...["abc", "+5", "0x5", "5.0", "-1", "", "99999999999999999999"].map(value => ({ "Content-Length": value })),
+        // FetchHeaders joins two caller rows into "5, 7".
+        twoRows,
+        { "content-length": "7", "Content-Length": "7" },
+        // Not a count even when a usable Transfer-Encoding makes it moot.
+        { "Content-Length": "abc", "Transfer-Encoding": "chunked" },
+      ];
+      for (const headers of rows) {
+        expect(await outcome(post(origin.url, headers, makeBody))).toEqual(invalidHeader);
+        // The next fetch to the origin works, and is the only request it sees.
+        expect(await outcome(post(origin.url, {}, makeBody))).toBe("OK");
+        expect(await origin.nextRequest()).toEqual({ framing: ["Transfer-Encoding: chunked"], body: chunked });
+      }
+      expect(origin.connections).toBe(rows.length);
+    });
+
+    it("rejects a Transfer-Encoding that is not a list of known codings ending in chunked, before anything is sent", async () => {
+      await using origin = await rawOrigin();
+      const rows: Bun.HeadersInit[] = [
+        ...["identity", "gzip", "chunked, gzip", "chunked, chunked", "gzip; q=1, chunked", "br2, chunked", ""].map(
+          value => ({ "Transfer-Encoding": value }),
+        ),
+        // A usable Content-Length does not rescue it.
+        { "Transfer-Encoding": "gzip", "Content-Length": String(body.length) },
+      ];
+      for (const headers of rows) {
+        expect(await outcome(post(origin.url, headers, makeBody))).toEqual(invalidHeader);
+        expect(await outcome(post(origin.url, {}, makeBody))).toBe("OK");
+        expect(await origin.nextRequest()).toEqual({ framing: ["Transfer-Encoding: chunked"], body: chunked });
+      }
+      expect(origin.connections).toBe(rows.length);
+    });
+  });
+
+  it("treats fetch(new Request(url, init)) and fetch(request, { headers }) like fetch(url, init)", async () => {
+    await using origin = await rawOrigin();
+    const [, makeBody] = bodyKinds[0];
+    const init = (headers: Bun.HeadersInit) =>
+      ({ method: "POST", headers, body: makeBody(), duplex: "half" }) as RequestInit;
+    expect(await outcome(fetch(new Request(origin.url, init({ "Content-Length": "abc" }))))).toEqual(invalidHeader);
+    expect(
+      await outcome(fetch(new Request(origin.url, init({})), { headers: { "Transfer-Encoding": "gzip" } })),
+    ).toEqual(invalidHeader);
+    expect(await outcome(fetch(new Request(origin.url, init({ "Content-Length": "2" }))))).toEqual(mismatch);
+    expect((await origin.nextRequest()).body).toBe("");
+    expect(origin.connections).toBe(1);
+  });
+
+  it("keeps the computed Content-Length for a body it can measure", async () => {
+    await using origin = await rawOrigin();
+    // A blob-backed stream has a known size. The caller's framing headers are
+    // dropped and the computed Content-Length wins, as for a string or a Blob.
+    for (const headers of [{ "Content-Length": "2" }, { "Content-Length": "abc" }, { "Transfer-Encoding": "gzip" }]) {
+      expect(await outcome(post(origin.url, headers as any, () => new Response(body).body))).toBe("OK");
+      expect(await origin.nextRequest()).toEqual({ framing: [`Content-Length: ${body.length}`], body });
+    }
+  });
+
+  describe("across a redirect", () => {
+    // A 303 (or a 301/302 on POST) drops the stream body and follows with a GET.
+    // The caller's framing headers describe that dropped body, so the follow-up
+    // must carry neither of them: a bodyless GET that announces Content-Length: 7
+    // makes the target read the next request on the connection as its body.
+    type Seen = { connection: number; request: string; framing: string[]; body: string };
+
+    // A keep-alive origin: it parses every request on a connection by its own
+    // framing, records it, and answers by path. "/early-303" answers before it
+    // reads the body. "/303" and "/307" answer once the body is complete.
+    async function redirectOrigin() {
+      const queue: Seen[] = [];
+      const waiting: ((seen: Seen) => void)[] = [];
+      const seenPaths = new Map<string, PromiseWithResolvers<void>>();
+      const whenSeen = (request: string) => {
+        if (!seenPaths.has(request)) seenPaths.set(request, Promise.withResolvers<void>());
+        return seenPaths.get(request)!.promise;
+      };
+      let connections = 0;
+      let requests = 0;
+      const record = (seen: Seen) => {
+        requests++;
+        whenSeen(seen.request);
+        seenPaths.get(seen.request)!.resolve();
+        const resolve = waiting.shift();
+        if (resolve) resolve(seen);
+        else queue.push(seen);
+      };
+      const reply = (status: string, extra = "", text = "") =>
+        `HTTP/1.1 ${status}\r\n${extra}Content-Length: ${text.length}\r\n\r\n${text}`;
+      const sockets = new Set<net.Socket>();
+      const server = net.createServer(socket => {
+        const connection = ++connections;
+        let raw = "";
+        let abandoned = false;
+        sockets.add(socket);
+        socket.on("close", () => sockets.delete(socket));
+        socket.on("error", () => {});
+        socket.on("data", data => {
+          if (abandoned) return;
+          raw += data.toString("latin1");
+          for (;;) {
+            const headerEnd = raw.indexOf("\r\n\r\n");
+            if (headerEnd === -1) return;
+            const lines = raw.slice(0, headerEnd).split("\r\n");
+            const request = lines[0].replace(/ HTTP\/1\.1$/, "");
+            const framing = lines.slice(1).filter(line => /^(content-length|transfer-encoding):/i.test(line));
+            const rest = raw.slice(headerEnd + 4);
+            if (request === "POST /early-303") {
+              // The rest of this connection is the body the client gives up on.
+              abandoned = true;
+              record({ connection, request, framing, body: "" });
+              socket.write(reply("303 See Other", "Location: /next\r\n"));
+              return;
+            }
+            let bodyLength = 0;
+            if (framing.some(line => /^transfer-encoding:.*chunked\s*$/i.test(line))) {
+              const end = rest.indexOf("0\r\n\r\n");
+              if (end === -1) return;
+              bodyLength = end + 5;
+            } else {
+              bodyLength = Number(/^content-length:\s*(\d+)\s*$/i.exec(framing[0] ?? "")?.[1] ?? 0);
+              if (rest.length < bodyLength) return;
+            }
+            record({ connection, request, framing, body: rest.slice(0, bodyLength) });
+            raw = rest.slice(bodyLength);
+            if (request === "POST /303") socket.write(reply("303 See Other", "Location: /next\r\n"));
+            else if (request === "POST /307") socket.write(reply("307 Temporary Redirect", "Location: /next\r\n"));
+            else socket.write(reply("200 OK", "", "OK"));
+          }
+        });
+      });
+      await once(server.listen(0, "localhost"), "listening");
+      return {
+        url: `http://localhost:${(server.address() as AddressInfo).port}/`,
+        take: () =>
+          queue.length > 0 ? Promise.resolve(queue.shift()!) : new Promise<Seen>(resolve => waiting.push(resolve)),
+        whenSeen,
+        get requests() {
+          return requests;
+        },
+        // The client keeps these connections alive in its pool; close() would wait for them.
+        [Symbol.asyncDispose]: () => {
+          for (const socket of sockets) socket.destroy();
+          return server[Symbol.asyncDispose]();
+        },
+      };
+    }
+
+    const [, makeBody] = bodyKinds[0];
+    const framings: [string, Bun.HeadersInit, Pick<Seen, "framing" | "body">][] = [
+      ["Content-Length: 7", { "Content-Length": "7" }, { framing: ["Content-Length: 7"], body }],
+      [
+        "Transfer-Encoding: gzip, chunked",
+        { "Transfer-Encoding": "gzip, chunked" },
+        { framing: ["Transfer-Encoding: gzip, chunked"], body: chunked },
+      ],
+      ["no framing header", {}, { framing: ["Transfer-Encoding: chunked"], body: chunked }],
+    ];
+
+    it.each(framings)("a 303 follow-up carries no framing header (%s)", async (_, headers, hop1) => {
+      await using origin = await redirectOrigin();
+      const response = await post(origin.url + "303", headers, makeBody);
+      expect([response.status, response.redirected, await response.text()]).toEqual([200, true, "OK"]);
+      expect(await origin.take()).toMatchObject({ request: "POST /303", ...hop1 });
+      const followUp = await origin.take();
+      expect(followUp).toEqual({ connection: followUp.connection, request: "GET /next", framing: [], body: "" });
+      // Nothing is left over on the follow-up's connection: the next fetch reuses
+      // it and the origin parses that request as its own.
+      expect(await outcome(fetch(origin.url + "after", { method: "POST", body: "hello" }))).toBe("OK");
+      expect(await origin.take()).toEqual({
+        connection: followUp.connection,
+        request: "POST /after",
+        framing: ["Content-Length: 5"],
+        body: "hello",
+      });
+    });
+
+    it("a 303 that arrives before the body resolves with the final response and drops hop 1's connection", async () => {
+      await using origin = await redirectOrigin();
+      // The stream says nothing until the follow-up has reached the origin, then
+      // ends 7 bytes short of its declared length. That body was already dropped,
+      // so the count does not fail the fetch.
+      const followedUp = origin.whenSeen("GET /next");
+      const late = new ReadableStream({
+        async pull(controller) {
+          await followedUp;
+          controller.close();
+        },
+      });
+      const response = await post(origin.url + "early-303", { "Content-Length": "7" }, () => late);
+      expect([response.status, response.redirected, await response.text()]).toEqual([200, true, "OK"]);
+      const hop1 = await origin.take();
+      expect(hop1).toMatchObject({ request: "POST /early-303", framing: ["Content-Length: 7"] });
+      const followUp = await origin.take();
+      expect(followUp).toMatchObject({ request: "GET /next", framing: [], body: "" });
+      // Hop 1 still owed 7 body bytes, so its connection was closed, not pooled.
+      expect(followUp.connection).not.toBe(hop1.connection);
+    });
+
+    it.each(framings)("a 307 rejects as not replayable (%s)", async (_, headers, hop1) => {
+      await using origin = await redirectOrigin();
+      const rejection = await post(origin.url + "307", headers, makeBody).then(
+        response => response.status,
+        e => ({ name: e?.name, message: e?.message }),
+      );
+      expect(rejection).toEqual({
+        name: "TypeError",
+        message: "Request body is a ReadableStream and cannot be replayed for this redirect",
+      });
+      expect(await origin.take()).toMatchObject({ request: "POST /307", ...hop1 });
+      expect(origin.requests).toBe(1);
+    });
+  });
+});
+
+it("releases interim 1xx response bytes as they are parsed while waiting for the final response", async () => {
+  // A misbehaving origin can stream an arbitrarily long sequence of interim (1xx)
+  // responses before the final status line. Bytes belonging to interim responses that
+  // have already been parsed must be released from the header accumulation buffer as
+  // they are consumed, instead of being retained (and re-parsed) for the lifetime of
+  // the request. The flood below totals ~48 MB of interim responses, so process RSS
+  // must not grow by anywhere near that amount while the request is still waiting for
+  // its final status line, and the final response must still be delivered normally.
+  const informational = "HTTP/1.1 103 Early Hints\r\nx-filler: " + "a".repeat(1024) + "\r\n\r\n";
+  const responseLength = informational.length;
+  const writeSize = 256 * 1024 - 13; // never a multiple of responseLength, so writes end mid-response
+  const pattern = Buffer.from(informational.repeat(Math.ceil(writeSize / responseLength) + 2), "latin1");
+  const floodBytes = 48 * 1024 * 1024;
+
+  let floodedBytes = 0;
+  const { promise: floodDone, resolve: floodDoneResolve } = Promise.withResolvers<void>();
+  const sockets: net.Socket[] = [];
+  const server = net.createServer(socket => {
+    sockets.push(socket);
+    socket.once("data", () => {
+      const writeMore = () => {
+        while (floodedBytes < floodBytes) {
+          const offset = floodedBytes % responseLength;
+          const slice = pattern.subarray(offset, offset + writeSize);
+          floodedBytes += slice.length;
+          if (!socket.write(slice)) {
+            socket.once("drain", writeMore);
+            return;
+          }
+        }
+        floodDoneResolve();
+      };
+      writeMore();
+    });
+  });
+  await once(server.listen(0, "localhost"), "listening");
+  const { port } = server.address() as AddressInfo;
+
+  try {
+    Bun.gc(true);
+    const rssBefore = rss();
+    const responsePromise = fetch(`http://localhost:${port}/`);
+    await floodDone;
+    Bun.gc(true);
+    const rssDuringFlood = rss();
+
+    // Complete the partially written interim response, then send the real response.
+    const socket = sockets[0];
+    const tail = floodedBytes % responseLength;
+    if (tail !== 0) socket.write(pattern.subarray(tail, responseLength));
+    socket.end("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndone");
+
+    // The final response after the interim responses is still delivered normally.
+    const response = await responsePromise;
+    expect(await response.text()).toBe("done");
+
+    // Only a small parse tail may be retained while the interim responses stream in;
+    // the ~48 MB of already-consumed 1xx bytes must not accumulate in the process.
+    const deltaMB = (rssDuringFlood - rssBefore) / 1024 / 1024;
+    // A local `bun bd` debug build is ASAN-instrumented but not named
+    // `bun-asan`, so isASAN is false there; its quarantine retains the freed
+    // flood bytes the same way - give it the same allowance.
+    expect(deltaMB).toBeLessThan(isASAN || isDebug ? 48 : 16);
+  } finally {
+    for (const socket of sockets) socket.destroy();
+    server.close();
+  }
+}, 60_000);
+
+it("does not reuse a keep-alive connection when bytes follow a response that ended at its header block", async () => {
+  // Bodyless counterpart of the Content-Length overshoot test below. Each of these
+  // responses is complete once its header block is in (the followed 3xx through the
+  // redirect path, which pools the socket itself), so trailing bytes must cost the
+  // connection while the same responses without them must still be pooled.
+  const injected = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 8\r\n\r\ninjected";
+  const responses: Record<string, { head: string; junk: string }> = {
+    "/204": { head: "HTTP/1.1 204 No Content\r\nConnection: keep-alive\r\n\r\n", junk: injected },
+    "/304": { head: 'HTTP/1.1 304 Not Modified\r\nETag: "x"\r\nConnection: keep-alive\r\n\r\n', junk: injected },
+    "/empty": { head: "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n", junk: injected },
+    // Answered with HEAD: Content-Length describes the GET body, nothing may follow.
+    // The junk variant sends that body anyway.
+    "/head": { head: "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: keep-alive\r\n\r\n", junk: "hello" },
+    "/303": {
+      head: "HTTP/1.1 303 See Other\r\nLocation: /legit\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n",
+      junk: injected,
+    },
+  };
+  const legit =
+    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 6\r\nConnection: keep-alive\r\n\r\nlegit!";
+
+  let connections = 0;
+  const sockets: net.Socket[] = [];
+  const server = net.createServer(socket => {
+    connections++;
+    sockets.push(socket);
+    socket.on("error", () => {});
+    let buffered = "";
+    socket.on("data", data => {
+      buffered += data.toString("latin1");
+      while (true) {
+        const headerEnd = buffered.indexOf("\r\n\r\n");
+        if (headerEnd === -1) return;
+        const head = buffered.slice(0, headerEnd);
+        // Consume the request body (the redirect case is a POST) before answering, so
+        // body bytes are never mistaken for the next request.
+        let requestEnd = headerEnd + 4;
+        if (/^transfer-encoding:.*\bchunked\b/im.test(head)) {
+          const terminator = buffered.indexOf("0\r\n\r\n", requestEnd);
+          if (terminator === -1) return;
+          requestEnd = terminator + 5;
+        } else {
+          requestEnd += Number(/^content-length:\s*(\d+)/im.exec(head)?.[1] ?? 0);
+          if (buffered.length < requestEnd) return;
+        }
+        buffered = buffered.slice(requestEnd);
+
+        const target = head.split("\r\n")[0].split(" ")[1];
+        const [path, query] = target.split("?");
+        const response = responses[path];
+        if (response) {
+          socket.write(response.head + (query === "junk" ? response.junk : ""));
+        } else {
+          socket.write(legit);
+        }
+      }
+    });
+  });
+  // 127.0.0.1 explicitly: counting connections requires the server to listen on the
+  // address fetch() connects to.
+  await once(server.listen(0, "127.0.0.1"), "listening");
+  const { port } = server.address() as AddressInfo;
+  const origin = `http://127.0.0.1:${port}`;
+
+  const cases: { path: string; init?: () => RequestInit }[] = [
+    { path: "/204" },
+    { path: "/304" },
+    { path: "/empty" },
+    { path: "/head", init: () => ({ method: "HEAD" }) },
+    // The redirect path only pools the socket once the upload is known to be
+    // complete, which today is the case for streamed bodies, so a streamed POST is
+    // what exercises that path's pooling decision.
+    {
+      path: "/303",
+      init: () => ({
+        method: "POST",
+        body: new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode("payload"));
+            controller.close();
+          },
+        }),
+      }),
+    },
+  ];
+
+  try {
+    // Warm the pool with one clean connection so every case below starts out
+    // reusing a pooled socket.
+    expect(await (await fetch(`${origin}/legit`)).text()).toBe("legit!");
+    expect(connections).toBe(1);
+
+    const results: { request: string; status: number; body: string; newConnections: number }[] = [];
+    for (const { path, init } of cases) {
+      for (const junk of [true, false]) {
+        const before = connections;
+        const response = await fetch(`${origin}${path}${junk ? "?junk" : ""}`, init?.());
+        const body = await response.text();
+        // newConnections counts what this response plus the follow-up request opened.
+        const followUp = await fetch(`${origin}/legit`);
+        expect(await followUp.text()).toBe("legit!");
+        results.push({
+          request: `${path}${junk ? " + trailing bytes" : ""}`,
+          status: response.status,
+          body,
+          newConnections: connections - before,
+        });
+      }
+    }
+
+    expect(results).toEqual([
+      { request: "/204 + trailing bytes", status: 204, body: "", newConnections: 1 },
+      { request: "/204", status: 204, body: "", newConnections: 0 },
+      { request: "/304 + trailing bytes", status: 304, body: "", newConnections: 1 },
+      { request: "/304", status: 304, body: "", newConnections: 0 },
+      { request: "/empty + trailing bytes", status: 200, body: "", newConnections: 1 },
+      { request: "/empty", status: 200, body: "", newConnections: 0 },
+      { request: "/head + trailing bytes", status: 200, body: "", newConnections: 1 },
+      { request: "/head", status: 200, body: "", newConnections: 0 },
+      // The redirect is still followed; only the hop to /legit needs the new connection.
+      { request: "/303 + trailing bytes", status: 200, body: "legit!", newConnections: 1 },
+      { request: "/303", status: 200, body: "legit!", newConnections: 0 },
+    ]);
+  } finally {
+    for (const socket of sockets) socket.destroy();
+    server.close();
+  }
+});
+
+it("does not reuse a keep-alive connection whose response carried more bytes than its Content-Length", async () => {
+  // Surplus bytes past the declared Content-Length mean the connection's framing can
+  // no longer be trusted: anything still buffered on (or later delivered to) that
+  // socket would be parsed as the response to whichever request next reuses it from
+  // the keep-alive pool. The mis-framed response itself is still delivered (truncated
+  // to its declared length), but the connection must be closed instead of pooled.
+  let connections = 0;
+  const sockets: net.Socket[] = [];
+  const server = net.createServer(socket => {
+    connections++;
+    sockets.push(socket);
+    let buffered = "";
+    socket.on("data", data => {
+      buffered += data.toString("latin1");
+      while (true) {
+        const headerEnd = buffered.indexOf("\r\n\r\n");
+        if (headerEnd === -1) break;
+        const head = buffered.slice(0, headerEnd);
+        buffered = buffered.slice(headerEnd + 4);
+        const path = head.split("\r\n")[0].split(" ")[1];
+        if (path === "/overshoot") {
+          // Declares 5 body bytes but sends those 5 plus a complete pipelined
+          // "injected" response that the declared framing never accounted for.
+          socket.write(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\nConnection: keep-alive\r\n\r\nhello" +
+              "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 8\r\n\r\ninjected",
+          );
+        } else {
+          socket.write(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 6\r\nConnection: keep-alive\r\n\r\nlegit!",
+          );
+        }
+      }
+    });
+  });
+  await once(server.listen(0, "localhost"), "listening");
+  const { port } = server.address() as AddressInfo;
+
+  try {
+    // The mis-framed response is still delivered, truncated to its declared length.
+    const first = await fetch(`http://localhost:${port}/overshoot`);
+    expect(await first.text()).toBe("hello");
+
+    // The follow-up request must go out on a fresh connection, so it can never be
+    // answered by the leftover "injected" bytes on the desynchronized socket.
+    const second = await fetch(`http://localhost:${port}/after`);
+    expect(await second.text()).toBe("legit!");
+    expect(connections).toBe(2);
+
+    // A correctly framed keep-alive response is still pooled and reused.
+    const third = await fetch(`http://localhost:${port}/again`);
+    expect(await third.text()).toBe("legit!");
+    expect(connections).toBe(2);
+  } finally {
+    for (const socket of sockets) socket.destroy();
+    server.close();
+  }
+});
+
+// https://github.com/oven-sh/bun/issues/16682
+it("an explicit numeric `timeout` extends the socket idle deadline past the default", async () => {
+  // The child runs with a 1s idle default (BUN_CONFIG_HTTP_IDLE_TIMEOUT=1) and
+  // talks to an in-process server whose handler holds every request idle for
+  // 10s (longer than the worst-case firing window of the 1s idle timer, which
+  // is swept on uSockets' 4s tick) before responding.
+  //
+  //   - `timeout: 60_000` must override the 1s idle default and resolve.
+  //   - `timeout: 0` must keep meaning "no timeout" and resolve.
+  //   - no `timeout` at all must still hit the 1s idle default (control that
+  //     proves the env override and the stall are both real).
+  const script = /* js */ `
+    const HOLD_MS = 10_000;
+    using server = Bun.serve({
+      port: 0,
+      // Disable Bun.serve's own request idle timeout; only the client-side
+      // idle timer under test may abort anything here.
+      idleTimeout: 0,
+      async fetch(req) {
+        const arrived = Date.now();
+        // Hold the connection idle (no bytes in either direction) until the
+        // hold window has really elapsed on the server's clock.
+        while (Date.now() - arrived < HOLD_MS) {
+          await Bun.sleep(HOLD_MS - (Date.now() - arrived));
+        }
+        return new Response("hello");
+      },
+    });
+    const get = init => fetch(server.url, init).then(r => r.text(), e => "ERR:" + (e?.code ?? e?.name ?? e));
+    const [withTimeout, withZero, withInfinity, withDefault] = await Promise.all([
+      get({ timeout: 60_000 }),
+      get({ timeout: 0 }),
+      get({ timeout: Infinity }),
+      get(undefined),
+    ]);
+    console.log(JSON.stringify({ withTimeout, withZero, withInfinity, withDefault }));
+  `;
+  await using proc = Bun.spawn({
+    cmd: [bunExe(), "-e", script],
+    env: { ...bunEnv, BUN_CONFIG_HTTP_IDLE_TIMEOUT: "1" },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+  const out = JSON.parse(stdout.trim().split("\n").pop()!) as Record<string, string>;
+  expect({ withTimeout: out.withTimeout, withZero: out.withZero, withInfinity: out.withInfinity }).toEqual({
+    withTimeout: "hello",
+    withZero: "hello",
+    withInfinity: "hello",
+  });
+  // Control: without an explicit `timeout`, the 1s idle default still aborts
+  // the stalled request.
+  expect(out.withDefault).toStartWith("ERR:");
+  expect(exitCode).toBe(0);
+}, 60_000);
+
+it("the idle timer is an absolute deadline for the response header block (not re-armed by a byte drip)", async () => {
+  // A server that trickles one response-header byte at a time, each interval
+  // shorter than the request's idle timeout, must not be able to keep the
+  // request alive indefinitely. The idle timer is armed when the request is
+  // written and is not re-armed on partial header reads, so it bounds how long
+  // the header block may take to arrive in total (undici `headersTimeout`
+  // semantics). Once the header block completes the body path re-arms per
+  // chunk, so a slow-but-steady body is still accepted.
+  const BODY = "abc";
+  const HEAD = `HTTP/1.1 200 OK\r\nContent-Length: ${BODY.length}\r\n\r\n`;
+  const DRIP_MS = 2_000;
+  const DRIP_N = 10; // header drip sends this many single bytes, then the rest at once
+  const IDLE_MS = 5_000;
+
+  const sockets = new Set<net.Socket>();
+  const intervals = new Set<ReturnType<typeof setInterval>>();
+  const server = net.createServer(sock => {
+    sockets.add(sock);
+    sock.on("close", () => sockets.delete(sock));
+    sock.on("error", () => {});
+    sock.once("data", chunk => {
+      // /h drips DRIP_N header bytes then bursts the rest + body.
+      // /b bursts the header block then drips the body byte-by-byte.
+      const headerDrip = chunk.includes("/h ");
+      if (!headerDrip) sock.write(HEAD);
+      const dripped = headerDrip ? HEAD.slice(0, DRIP_N) : BODY;
+      const tail = headerDrip ? HEAD.slice(DRIP_N) + BODY : "";
+      let i = 0;
+      const iv = setInterval(() => {
+        if (sock.destroyed) {
+          clearInterval(iv);
+          intervals.delete(iv);
+          return;
+        }
+        if (i < dripped.length) {
+          sock.write(dripped[i++]);
+        } else {
+          clearInterval(iv);
+          intervals.delete(iv);
+          sock.end(tail);
+        }
+      }, DRIP_MS);
+      intervals.add(iv);
+    });
+  });
+  await new Promise<void>(r => server.listen(0, "127.0.0.1", () => r()));
+  const port = (server.address() as AddressInfo).port;
+
+  try {
+    const settle = (path: string) =>
+      fetch(`http://127.0.0.1:${port}${path}`, { timeout: IDLE_MS }).then(
+        async r => ({ ok: true as const, status: r.status, body: await r.text() }),
+        e => ({ ok: false as const, name: e?.name as string, message: String(e?.message ?? e) }),
+      );
+
+    // /h: DRIP_N bytes * DRIP_MS = ~20s of drip before the response would
+    // complete; the 5s idle deadline (armed padded on uSockets' 4s-tick
+    // sweep, so it fires at ~8-12s) must fire first. A build that re-arms on
+    // every partial header read resolves 200 after the full drip instead.
+    // /b: headers arrive in one write, then the 3-byte body trickles at
+    // DRIP_MS/byte (~8s). Each body chunk re-arms the idle timer, so this
+    // resolves despite taking longer than IDLE_MS overall.
+    const [hdr, bod] = await Promise.all([settle("/h"), settle("/b")]);
+    expect({ hdr, bod }).toEqual({
+      hdr: { ok: false, name: "TimeoutError", message: "The operation timed out." },
+      bod: { ok: true, status: 200, body: BODY },
+    });
+  } finally {
+    for (const iv of intervals) clearInterval(iv);
+    for (const s of sockets) s.destroy();
+    await new Promise<void>(r => server.close(() => r()));
+  }
+}, 60_000);
+
+// https://github.com/oven-sh/bun/issues/39952
+it("a numeric `timeout` does not abort in-flight requests on the 4s sweep tick", async () => {
+  // Regression: a `timeout` of 4000ms or less was armed as a single tick of
+  // uSockets' 4s sweep timer, whose phase is unrelated to the request, so the
+  // next sweep aborted whichever request was in flight, no matter how long it
+  // had been running. Keep at least one request in flight for longer than one
+  // full sweep period: none may abort, because each request idles only
+  // ~SLEEP_MS against a 1000ms budget.
+  const SLEEP_MS = 600;
+  const WINDOW_MS = 5_500; // one full 4s sweep period at any phase, plus slop
+  await using server = Bun.serve({
+    port: 0,
+    idleTimeout: 0,
+    async fetch() {
+      await Bun.sleep(SLEEP_MS);
+      return new Response("ok");
+    },
+  });
+  const errors: string[] = [];
+  const start = Date.now();
+  const worker = async (offsetMs: number) => {
+    // Stagger the start so the workers' request waves interleave: workers
+    // launched together stay phase-locked, and their inter-request gaps
+    // could all line up with the sweep tick.
+    await Bun.sleep(offsetMs);
+    while (Date.now() - start < WINDOW_MS && errors.length === 0) {
+      const t0 = Date.now();
+      try {
+        const res = await fetch(server.url, { timeout: 1000 });
+        await res.text();
+      } catch (e) {
+        errors.push(`${(e as Error).name} after ${Date.now() - t0}ms on the request started at t=${t0 - start}ms`);
+      }
+    }
+  };
+  // Three staggered workers so a sweep tick always lands on an in-flight
+  // request in the unfixed build.
+  await Promise.all([worker(0), worker(SLEEP_MS / 3), worker((2 * SLEEP_MS) / 3)]);
+  expect(errors).toEqual([]);
+}, 20_000);
+
+it.skipIf(isWindows)("sends the exact Content-Length for a file body of 100 GB", async () => {
+  using dir = tempDir("fetch-large-file-body", { "large.bin": "" });
+  const path = join(String(dir), "large.bin");
+  const size = 100_000_000_000;
+  const fd = openSync(path, "r+");
+  try {
+    ftruncateSync(fd, size);
+  } finally {
+    closeSync(fd);
+  }
+  expect(Bun.file(path).size).toBe(size);
+
+  const { promise: headPromise, resolve: resolveHead } = Promise.withResolvers<string>();
+  let received = "";
+  let headComplete = false;
+  using listener = Bun.listen({
+    hostname: "127.0.0.1",
+    port: 0,
+    socket: {
+      data(socket, chunk) {
+        if (headComplete) return;
+        received += chunk.toString("latin1");
+        const end = received.indexOf("\r\n\r\n");
+        if (end !== -1) {
+          headComplete = true;
+          resolveHead(received.slice(0, end));
+          socket.end();
+        }
+      },
+    },
+  });
+
+  const controller = new AbortController();
+  const result = fetch(`http://${listener.hostname}:${listener.port}/upload`, {
+    method: "PUT",
+    body: Bun.file(path),
+    signal: controller.signal,
+  }).then(
+    () => null,
+    e => e,
+  );
+
+  const head = await headPromise;
+  controller.abort();
+  await result;
+
+  const contentLength = head
+    .split("\r\n")
+    .find(line => line.toLowerCase().startsWith("content-length:"))
+    ?.slice("content-length:".length)
+    .trim();
+  expect(contentLength).toBe(String(size));
+});
+
+it("verbose fetch logging prints [redacted] in place of Authorization credentials", async () => {
+  using server = Bun.serve({
+    port: 0,
+    fetch(req) {
+      return new Response(req.headers.get("authorization") ?? "");
+    },
+  });
+
+  await using proc = Bun.spawn({
+    cmd: [
+      bunExe(),
+      "-e",
+      `const res = await fetch(process.env.SERVER_URL, { headers: { Authorization: "Bearer sekret-token" } });
+       console.log(await res.text());`,
+    ],
+    env: { ...bunEnv, BUN_CONFIG_VERBOSE_FETCH: "1", SERVER_URL: server.url.href },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+
+  const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+
+  expect(stdout).toBe("Bearer sekret-token\n");
+  const authorizationLines = stderr.split(/\r?\n/).flatMap(line => {
+    const match = /^(?:\[fetch\])?\s*>?\s*authorization:(.*)$/i.exec(line);
+    return match ? [match[1].trim()] : [];
+  });
+  expect(authorizationLines).toEqual(["Bearer [redacted]"]);
+  expect(stderr).not.toContain("sekret-token");
+  expect(exitCode).toBe(0);
+});
+
+it("verbose fetch logging escapes control characters coming from the peer", async () => {
+  // U+009B is the one-byte form of ESC [ (CSI), so "\u009b31m" written to a terminal as-is turns
+  // the rest of the line red. HTTP/1.1 lets a server put any byte >= 0x80 in a reason phrase or
+  // header value, which includes the UTF-8 encoding of U+009B.
+  let request = "";
+  using listener = Bun.listen({
+    hostname: "127.0.0.1",
+    port: 0,
+    socket: {
+      data(socket, chunk) {
+        request += chunk.toString("latin1");
+        if (!request.includes("\r\n\r\n")) return;
+        socket.end(
+          Buffer.from(
+            "HTTP/1.1 500 Server \u009bError\r\n" +
+              "x-evil: a\u009b31mb\r\n" +
+              "content-length: 0\r\n" +
+              "connection: close\r\n" +
+              "\r\n",
+          ),
+        );
+      },
+    },
+  });
+
+  // Header values are byte strings, so the two Latin-1 characters "\u00c2\u009b" are sent as the
+  // bytes C2 9B, i.e. the same UTF-8 encoded U+009B the server sends back.
+  await using proc = Bun.spawn({
+    cmd: [
+      bunExe(),
+      "-e",
+      `const res = await fetch(process.env.SERVER_URL, {
+         verbose: "curl",
+         headers: { "x-req": "v\\u00c2\\u009b31mq", authorization: "Bea\\u00c2\\u009brer sekret-token" },
+       });
+       console.log(res.status);`,
+    ],
+    env: { ...bunEnv, SERVER_URL: `http://127.0.0.1:${listener.port}/` },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+
+  const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+
+  expect(stdout).toBe("500\n");
+  // The request line and the response status line are printed on their own lines; header lines
+  // are printed once per header in the "name: value" trace and once more in the curl command.
+  expect(stderr).toMatch(/^.*x-req: v\\u009b31mq$/im);
+  expect(stderr).toMatch(/^.*authorization: Bea\\u009brer \[redacted\]$/im);
+  expect(stderr).toMatch(/^< 500 Server \\u009bError$/m);
+  expect(stderr).toMatch(/^< x-evil: a\\u009b31mb$/m);
+  expect(stderr).toContain(`-H "x-req: v\\u009b31mq"`);
+  expect(stderr).not.toMatch(/[\x80-\x9f]/);
+  expect(exitCode).toBe(0);
 });

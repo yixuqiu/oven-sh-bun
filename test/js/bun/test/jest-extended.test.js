@@ -45,18 +45,22 @@ describe("jest-extended", () => {
       new Uint8Array(),
       new Object(),
       Buffer.from(""),
-      ...(isBun ? [Bun.file("/tmp/empty.txt")] : []),
       new Headers(),
       new URLSearchParams(),
       new FormData(),
       (function* () {})(),
     ];
+    if (isBun) {
+      const { join } = require("path");
+      const { tmpdir } = require("os");
+      const { mkdtempSync, writeFileSync } = require("fs");
+      const tmpDir = mkdtempSync(join(tmpdir(), "jest-extended-"));
+      const tmpFile = join(tmpDir, "empty.txt");
+      values.push(Bun.file(tmpFile));
+      writeFileSync(tmpFile, "");
+    }
     for (const value of values) {
       test(label(value), () => {
-        if (value && typeof value === "object" && value instanceof Blob) {
-          require("fs").writeFileSync("/tmp/empty.txt", "");
-        }
-
         expect(value).toBeEmpty();
       });
     }
@@ -173,10 +177,85 @@ describe("jest-extended", () => {
 
     // Test errors
     // @ts-expect-error
-    expect(() => expect(1).toSatisfy(() => new Error("Bun!"))).toThrow("predicate threw an exception");
+    expect(() =>
+      expect(1).toSatisfy(() => {
+        throw new Error("Bun!");
+      }),
+    ).toThrow("Bun!");
     // @ts-expect-error
-    expect(() => expect(1).not.toSatisfy(() => new Error("Bun!"))).toThrow("predicate threw an exception");
+    expect(() =>
+      expect(1).not.toSatisfy(() => {
+        throw new Error("Bun!");
+      }),
+    ).toThrow("Bun!");
   });
+
+  test("expect.toSatisfy()", () => {
+    const isOdd = value => value % 2 === 1;
+
+    expect(3).toEqual(expect.toSatisfy(isOdd));
+    expect(2).not.toEqual(expect.toSatisfy(isOdd));
+    expect({ a: 3 }).toEqual({ a: expect.toSatisfy(isOdd) });
+    expect({ a: 2 }).not.toEqual({ a: expect.toSatisfy(isOdd) });
+    expect({ a: 2 }).toEqual({ a: expect.not.toSatisfy(isOdd) });
+    expect({ a: 3 }).not.toEqual({ a: expect.not.toSatisfy(isOdd) });
+    expect([1, 2]).toStrictEqual([expect.toSatisfy(isOdd), expect.not.toSatisfy(isOdd)]);
+    expect({ a: 3, b: 1 }).toMatchObject({ a: expect.toSatisfy(isOdd) });
+    expect([2, 3]).toContainEqual(expect.toSatisfy(isOdd));
+    expect([2, 4]).not.toContainEqual(expect.toSatisfy(isOdd));
+
+    const called = jest.fn();
+    called(3);
+    expect(called).toHaveBeenCalledWith(expect.toSatisfy(isOdd));
+    expect(called).not.toHaveBeenCalledWith(expect.not.toSatisfy(isOdd));
+
+    // The predicate gets the received value alone, and any truthy result counts.
+    const predicate = jest.fn(() => "truthy");
+    expect(7).toEqual(expect.toSatisfy(predicate, "message"));
+    expect(predicate.mock.calls).toEqual([[7]]);
+    expect(7).not.toEqual(expect.toSatisfy(() => 0));
+    expect(7).not.toEqual(expect.toSatisfy(() => undefined));
+    expect(7).toEqual(expect.not.toSatisfy(() => undefined));
+
+    expect(() =>
+      expect(1).toEqual(
+        expect.toSatisfy(() => {
+          throw new Error("Bun!");
+        }),
+      ),
+    ).toThrow("Bun!");
+  });
+
+  if (isBun) {
+    test("expect.toSatisfy() prints its arguments on one line", () => {
+      const isOdd = value => value % 2 === 1;
+      const messageOf = fn => {
+        try {
+          fn();
+        } catch (e) {
+          return Bun.stripANSI(e.message);
+        }
+      };
+
+      expect(inspect(expect.toSatisfy(isOdd))).toBe("toSatisfy<[Function isOdd]>");
+      expect(inspect(expect.toSatisfy(isOdd, "is odd"))).toBe('toSatisfy<[Function isOdd], "is odd">');
+      expect(inspect(expect.not.toSatisfy(() => true))).toBe("not.toSatisfy<[Function anonymous]>");
+      expect(messageOf(() => expect({ a: 2 }).toEqual({ a: expect.toSatisfy(isOdd, "is odd") }))).toContain(
+        '-   "a": toSatisfy<[Function isOdd], "is odd">,\n+   "a": 2,\n',
+      );
+      expect({ a: expect.toSatisfy(isOdd) }).toMatchInlineSnapshot(`
+        {
+          "a": toSatisfy<[Function isOdd]>,
+        }
+      `);
+    });
+
+    test("expect.toSatisfy() needs a function", () => {
+      for (const make of [() => expect.toSatisfy(), () => expect.toSatisfy(5), () => expect.not.toSatisfy("isOdd")]) {
+        expect(make).toThrow("Expected a function");
+      }
+    });
+  }
 
   // Array
 
@@ -200,6 +279,10 @@ describe("jest-extended", () => {
     expect({}).not.toBeArrayOfSize(1);
     expect("").not.toBeArrayOfSize(1);
     expect(0).not.toBeArrayOfSize(1);
+    // Array length can be up to 2^32-1, which exceeds i32 range.
+    expect(new Array(3_000_000_000)).toBeArrayOfSize(3_000_000_000);
+    expect(new Array(3_000_000_000)).not.toBeArrayOfSize(5);
+    expect(new Array(2 ** 32 - 1)).toBeArrayOfSize(2 ** 32 - 1);
   });
 
   // test('toIncludeAllMembers()')
@@ -251,7 +334,7 @@ describe("jest-extended", () => {
     expect(null).not.toBeDate();
   });
 
-  test.todo("toBeValidDate()", () => {
+  test("toBeValidDate()", () => {
     expect(new Date()).toBeValidDate();
     expect(new Date(-1)).toBeValidDate();
     expect("2021-01-01").not.toBeValidDate();
@@ -589,13 +672,13 @@ describe("jest-extended", () => {
     expect("abc").not.toIncludeRepeated("d", 1);
 
     // Any other number
-    expect("abc abc abc").toIncludeRepeated("abc", 1);
-    expect("abc abc abc").toIncludeRepeated("abc", 2);
+    expect("abc abc abc").not.toIncludeRepeated("abc", 1);
+    expect("abc abc abc").not.toIncludeRepeated("abc", 2);
     expect("abc abc abc").toIncludeRepeated("abc", 3);
     expect("abc abc abc").not.toIncludeRepeated("abc", 4);
 
     // Emojis/Unicode
-    expect("😘🥳😤😘🥳").toIncludeRepeated("😘", 1);
+    expect("😘🥳😤😘🥳").toIncludeRepeated("😘", 2);
     expect("😘🥳😤😘🥳").toIncludeRepeated("🥳", 2);
     expect("😘🥳😤😘🥳").not.toIncludeRepeated("😘", 3);
     expect("😘🥳😤😘🥳").not.toIncludeRepeated("😶‍🌫️", 1);

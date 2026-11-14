@@ -1,6 +1,6 @@
 import { $ } from "bun";
-import { createTestBuilder, redirect } from "./util";
 import { shellInternals } from "bun:internal-for-testing";
+import { createTestBuilder, redirect } from "./util";
 const { lex } = shellInternals;
 const TestBuilder = createTestBuilder(import.meta.path);
 
@@ -105,8 +105,7 @@ describe("lex shell", () => {
       { "Delimit": {} },
       { "Text": "dev" },
       { "Delimit": {} },
-      { "Text": "hello how is it going" },
-      { "Delimit": {} },
+      { "SingleQuotedText": "hello how is it going" },
       { "Eof": {} },
     ];
     const result = JSON.parse(lex`next dev 'hello how is it going'`);
@@ -692,16 +691,10 @@ describe("lex shell", () => {
         Delimit: {},
       },
       {
-        CmdSubstBegin: {},
-      },
-      {
-        Text: "ls",
+        Text: "`ls`",
       },
       {
         Delimit: {},
-      },
-      {
-        CmdSubstEnd: {},
       },
       {
         Eof: {},
@@ -711,6 +704,121 @@ describe("lex shell", () => {
     const result = lex`echo foo \`ls\``;
 
     expect(JSON.parse(result)).toEqual(expected);
+  });
+
+  // Where the lexer puts `Delimit` when a word's last part is not plain text
+  // (a variable, a closing quote, a brace group), or when the word is split
+  // into several tokens. Whitespace and operators delimit such a word; `;`
+  // and the end of input do not; the token that splits a word never does.
+  test.each([
+    [
+      "space after a variable",
+      "echo $FOO bar",
+      [
+        { Text: "echo" },
+        { Delimit: {} },
+        { Var: "FOO" },
+        { Delimit: {} },
+        { Text: "bar" },
+        { Delimit: {} },
+        { Eof: {} },
+      ],
+    ],
+    [
+      "newline after a variable",
+      "echo $FOO\nls",
+      [
+        { Text: "echo" },
+        { Delimit: {} },
+        { Var: "FOO" },
+        { Delimit: {} },
+        { Newline: {} },
+        { Text: "ls" },
+        { Delimit: {} },
+        { Eof: {} },
+      ],
+    ],
+    [
+      "escaped newline after a variable",
+      "echo $FOO\\\nls",
+      [
+        { Text: "echo" },
+        { Delimit: {} },
+        { Var: "FOO" },
+        { Delimit: {} },
+        { Text: "ls" },
+        { Delimit: {} },
+        { Eof: {} },
+      ],
+    ],
+    [
+      "operator after a variable",
+      "$FOO|b",
+      [{ Var: "FOO" }, { Delimit: {} }, { Pipe: {} }, { Text: "b" }, { Delimit: {} }, { Eof: {} }],
+    ],
+    [
+      "operator after a space adds no second delimiter",
+      "$FOO | b",
+      [{ Var: "FOO" }, { Delimit: {} }, { Pipe: {} }, { Text: "b" }, { Delimit: {} }, { Eof: {} }],
+    ],
+    [
+      "space after a closing quote",
+      '"a" b',
+      [{ DoubleQuotedText: "a" }, { Delimit: {} }, { Text: "b" }, { Delimit: {} }, { Eof: {} }],
+    ],
+    [
+      "space after a brace group",
+      "{a,b} c",
+      [
+        { BraceBegin: {} },
+        { Text: "a" },
+        { Comma: {} },
+        { Text: "b" },
+        { BraceEnd: {} },
+        { Delimit: {} },
+        { Text: "c" },
+        { Delimit: {} },
+        { Eof: {} },
+      ],
+    ],
+    [
+      "semicolon after a variable",
+      "$FOO;b",
+      [{ Var: "FOO" }, { Semicolon: {} }, { Text: "b" }, { Delimit: {} }, { Eof: {} }],
+    ],
+    [
+      "semicolon after a closing quote",
+      '"a";b',
+      [{ DoubleQuotedText: "a" }, { Semicolon: {} }, { Text: "b" }, { Delimit: {} }, { Eof: {} }],
+    ],
+    [
+      "semicolon after a brace group",
+      "{a,b};c",
+      [
+        { BraceBegin: {} },
+        { Text: "a" },
+        { Comma: {} },
+        { Text: "b" },
+        { BraceEnd: {} },
+        { Semicolon: {} },
+        { Text: "c" },
+        { Delimit: {} },
+        { Eof: {} },
+      ],
+    ],
+    ["end of input after a variable", "$FOO", [{ Var: "FOO" }, { Eof: {} }]],
+    [
+      "variable inside a word",
+      "foo$BAR baz",
+      [{ Text: "foo" }, { Var: "BAR" }, { Delimit: {} }, { Text: "baz" }, { Delimit: {} }, { Eof: {} }],
+    ],
+    [
+      "glob inside a word",
+      "a*b c",
+      [{ Text: "a" }, { Asterisk: {} }, { Text: "b" }, { Delimit: {} }, { Text: "c" }, { Delimit: {} }, { Eof: {} }],
+    ],
+  ])("delimit: %s", (_name, source, expected) => {
+    expect(JSON.parse(lex({ raw: [source] }))).toEqual(expected);
   });
 
   describe("errors", async () => {
@@ -751,5 +859,10 @@ describe("lex shell", () => {
 
       await TestBuilder.command`echo hi && (echo uh oh`.error("Unclosed subshell").run();
     });
+
+    // https://github.com/oven-sh/bun/issues/33235
+    TestBuilder.command`(((( |||`
+      .error("Unexpected EOF\nUnclosed subshell\nUnclosed subshell\nUnclosed subshell")
+      .runAsTest("multiple errors are newline separated");
   });
 });

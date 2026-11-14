@@ -1,20 +1,62 @@
 // This script is run when you change anything in src/js/*
 //
-// Originally, the builtin bundler only supported function files, but then the module files were
-// added to this, which has made this entire setup extremely convoluted and a mess.
+// Documentation is in src/js/README.md
 //
-// One day, this entire setup should be rewritten, but also it would be cool if Bun natively
-// supported macros that aren't json value -> json value. Otherwise, I'd use a real JS parser/ast
-// library, instead of RegExp hacks.
+// The brief summary of how this works is that I (@paperclover) wrote an insane
+// "JS lexer" using nothing but regular expressions. With lots of battle
+// testing, this works on basically all input. For all content not inside of a
+// string literal or comment, another set of regular expressions are performed
+// on the value to do a few magic things.
 //
-// For explanation on this, please nag @paperdave to write documentation on how everything works.
-import { readdirSync, rmSync } from "fs";
+// - Access to JSC's intrinsic syntax (`@foo()`) is done by just replacing all
+//   $s with @s. This is great because in source code, TypeScript types can
+//   model these relationships well. `@` is also how you refer to private slots
+//   within objects. So you can do `{ $data: data }` to store what appears to
+//   be an empty object to JS.
+// - Auto-prefixing known global identifiers with `@`, `AbortSignal` -> `@AbortSignal`
+//   to refer to the private slot.
+// - Some magic macros (see replacements.ts) such as `$assert()` (which forcibly
+//   deletes the argument in a release build, unlike a define macro), and the
+//   magical `$cpp` and `$bindgen` bindgen stuff -- a story for another day.
+//
+// Part of the transpilation process involves removing type annotations. And
+// that is done with Bun's bundler. But we need to construct an IIFE, and the
+// bundler did not have an IIFE mode. Let's wrap the input around markers:
+//
+//   $$capture_start$$(() => { YOUR IIFE }).$$capture_end$$
+//
+// The bundler won't rename those unbound globals, and it can be nicely sliced
+// back out by another regular expression.
+//
+// For builtin modules, those are converted from ES statements into a `return`
+// statement, with a hoisted variable named `$`. The code is weirdly split in
+// bundle-module.ts, but ever since the bindgen system was thrown together, the
+// two processors had to share global compilation state.
+//
+// Since this experience in 2024, I've learned that some things that
+// technically CAN be done, SHOULD NOT be done. Someone please rewrite this
+// within Bun's bundler directly, or via a nice JS parse -> AST tool.
+//
+// The output is intended to be similar to what WebCore does, but they use a
+// python script, and they write all the `@` syntax by hand. When generating,
+// we concatenate all the sources into one big string, which then creates a
+// single JSC::SourceProvider. Passing start/end positions to each function's
+// JSC::SourceCode. JSC does this, but WebCore does not seem to as of writing.
+import assert from "assert";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
 import path from "path";
+import { builtinFunctionFiles, builtinFunctionIds, firstBuiltinFunctionId } from "./builtin-function-ids";
 import { sliceSourceCode } from "./builtin-parser";
-import { applyGlobalReplacements, define } from "./replacements";
-import { cap, fmtCPPCharArray, low, writeIfNotChanged } from "./helpers";
 import { createAssertClientJS, createLogClientJS } from "./client-js";
-import { getJS2NativeDTS } from "./js2native-generator";
+import { getJS2NativeDTS } from "./generate-js2native";
+import { cap, checkAscii, low, writeIfNotChanged } from "./helpers";
+import { beginGuardedBody, endGuardedBody, removableFeatures } from "./removable-entry-points.ts";
+import {
+  applyGlobalReplacements,
+  assertNoDestructuredGlobalThis,
+  assertNoStoredFunctionBehindComma,
+  define,
+} from "./replacements";
 
 const PARALLEL = false;
 const KEEP_TMP = true;
@@ -38,20 +80,50 @@ interface ParsedBuiltin {
   directives: Record<string, any>;
   source: string;
   async: boolean;
+  enums: string[];
 }
 
 interface BundledBuiltin {
   name: string;
   directives: Record<string, any>;
-  isGetter: boolean;
   constructAbility: string;
-  constructKind: string;
-  isLinkTimeConstant: boolean;
-  intrinsic: string;
   overriddenName: string;
   source: string;
   params: string[];
   visibility: string;
+  sourceOffset: number;
+}
+
+function builtinSourceMetadata(source: string): (number | boolean)[] {
+  const isAsyncFunction = source.startsWith("(async function (");
+  if (!isAsyncFunction && !source.startsWith("(function ("))
+    throw new Error(
+      `expected a built-in function to begin with "(function (" or "(async function (", but it begins with ${source.slice(0, 20)}`,
+    );
+  const parametersStart = "function (".length + (isAsyncFunction ? "async ".length : 0);
+  let commas = 0;
+  let insideCurlyBrackets = false;
+  let sawOneParameter = false;
+  let hasRestParameter = false;
+  for (let i = parametersStart + 1; source[i] !== ")"; i++) {
+    if (i >= source.length) throw new Error("the parameter list of a built-in function has no closing parenthesis");
+    if (source[i] === "}") insideCurlyBrackets = false;
+    else if (source[i] === "{" || insideCurlyBrackets) {
+      insideCurlyBrackets = true;
+      continue;
+    } else if (source[i] === ",") commas++;
+    else if (!" \t\v\f\xa0".includes(source[i]!)) sawOneParameter = true;
+    if (source.startsWith("...", i)) {
+      hasRestParameter = true;
+      i += 2;
+    }
+  }
+  const parameterCount = (commas ? commas + 1 : sawOneParameter ? 1 : 0) - (hasRestParameter ? 1 : 0);
+  let isInStrictContext = false;
+  for (let i = 0; i + 1 + "use strict".length < source.length && !isInStrictContext; i++)
+    isInStrictContext = (source[i] === '"' || source[i] === "'") && source.startsWith("use strict", i + 1);
+  const closeBraceOffsetFromEnd = source.length - source.lastIndexOf("}");
+  return [source.length, parametersStart, parameterCount, closeBraceOffsetFromEnd, isAsyncFunction, isInStrictContext];
 }
 
 /**
@@ -59,28 +131,60 @@ interface BundledBuiltin {
  */
 async function processFileSplit(filename: string): Promise<{ functions: BundledBuiltin[]; internal: boolean }> {
   const basename = path.basename(filename, ".ts");
-  let contents = await Bun.file(filename).text();
+  let contents = readFileSync(filename, "utf8");
 
   contents = applyGlobalReplacements(contents);
+  const originalContents = contents;
 
   // first approach doesnt work perfectly because we actually need to split each function declaration
   // and then compile those separately
 
   const consumeWhitespace = /^\s*/;
-  const consumeTopLevelContent = /^(\/\*|\/\/|type|import|interface|\$|export (?:async )?function|(?:async )?function)/;
-  const consumeEndOfType = /;|.(?=export|type|interface|\$|\/\/|\/\*|function)/;
+  const consumeTopLevelContent =
+    /^(\/\*|\/\/|type|import|interface|\$|const enum|export (?:async )?function|(?:async )?function)/;
+  const consumeEndOfType = /;|.(?=export|type|interface|\$|\/\/|\/\*|function|const enum)/;
 
   const functions: ParsedBuiltin[] = [];
   let directives: Record<string, any> = {};
   const bundledFunctions: BundledBuiltin[] = [];
   let internal = false;
+  const topLevelEnums: { name: string; code: string }[] = [];
 
   while (contents.length) {
     contents = contents.replace(consumeWhitespace, "");
     if (!contents.length) break;
     const match = contents.match(consumeTopLevelContent);
     if (!match) {
-      throw new SyntaxError("Could not process input:\n" + contents.slice(0, contents.indexOf("\n")));
+      const pos = originalContents.length - contents.length;
+      let lineNumber = 1;
+      let columnNumber = 1;
+      let lineStartPos = 0;
+      for (let i = 0; i < pos; i++) {
+        if (originalContents[i] === "\n") {
+          lineNumber++;
+          columnNumber = 1;
+          lineStartPos = i + 1;
+        } else {
+          columnNumber++;
+        }
+        if (i === pos) {
+          break;
+        }
+      }
+      const lineEndPos = lineStartPos + originalContents.slice(lineStartPos).indexOf("\n");
+      throw new SyntaxError(
+        "Could not process input:\n" +
+          originalContents.slice(lineStartPos, lineEndPos) +
+          "\n" +
+          " ".repeat(pos - lineStartPos) +
+          "^" +
+          "\n    at " +
+          filename +
+          ":" +
+          lineNumber +
+          ":" +
+          columnNumber,
+      );
     }
     contents = contents.slice(match.index!);
     if (match[1] === "import") {
@@ -100,6 +204,16 @@ async function processFileSplit(filename: string): Promise<{ functions: BundledB
       contents = contents.slice(i + 1);
     } else if (match[1] === "interface") {
       contents = sliceSourceCode(contents, false).rest;
+    } else if (match[1] === "const enum") {
+      const { result, rest } = sliceSourceCode(contents, false);
+      const i = result.indexOf("{\n");
+      // Support const enums in module scope.
+      topLevelEnums.push({
+        name: result.slice("const enum ".length, i).trim(),
+        code: "\n" + result,
+      });
+
+      contents = rest;
     } else if (match[1] === "$") {
       const directive = contents.match(/^\$([a-zA-Z0-9]+)(?:\s*=\s*([^\r\n]+?))?\s*;?\r?\n/);
       if (!directive) {
@@ -114,39 +228,84 @@ async function processFileSplit(filename: string): Promise<{ functions: BundledB
       }
       if (name === "constructor") {
         directives.ConstructAbility = "CanConstruct";
-      } else if (name === "nakedConstructor") {
-        directives.ConstructAbility = "CanConstruct";
-        directives.ConstructKind = "Naked";
       } else {
         directives[name] = value;
       }
       contents = contents.slice(directive[0].length);
     } else if (match[1] === "export function" || match[1] === "export async function") {
-      const declaration = contents.match(
-        /^export\s+(async\s+)?function\s+([a-zA-Z0-9]+)\s*\(([^)]*)\)(?:\s*:\s*([^{\n]+))?\s*{?/,
-      );
-      if (!declaration)
-        throw new SyntaxError("Could not parse function declaration:\n" + contents.slice(0, contents.indexOf("\n")));
+      // consume async token and function name
+      const nameMatch = contents.match(/^export\s+(async\s+)?function\s([_a-zA-Z0-9]+)\s*/);
+      if (!nameMatch)
+        throw new SyntaxError("Could not parse function name:\n" + contents.slice(0, contents.indexOf("\n")));
+      const async = Boolean(nameMatch[1]);
+      const name = nameMatch[2];
+      var remaining = contents.slice(nameMatch[0].length);
 
-      const async = !!declaration[1];
-      const name = declaration[2];
-      const paramString = declaration[3];
+      // remove type parameters
+      if (remaining.startsWith("<")) {
+        var cursor = 1; // skip peeked '<'
+        var depth = 1; // already entered first bracket pair
+        for (; depth > 0 && cursor < remaining.length; cursor++) {
+          switch (remaining[cursor]) {
+            case "<":
+              depth++;
+              break;
+            case ">":
+              depth--;
+              break;
+          }
+        }
+
+        if (depth > 0) {
+          throw new SyntaxError(
+            `Function ${name} has an unclosed generic type. Missing ${depth} closing angle bracket(s).`,
+          );
+        }
+        remaining = remaining.slice(cursor).trimStart();
+      }
+
+      // parse function parameters
+      assert(
+        remaining.startsWith("("),
+        new SyntaxError(`Function ${name} is missing parameter list start. Found:\n\n\t${remaining.slice(0, 100)}`),
+      );
+      const paramMatch = remaining.match(/^\(([^)]*)\)(?:\s*:\s*([^{\n]+))?\s*{?/);
+      if (!paramMatch)
+        throw new SyntaxError(
+          `Could not parse parameters for function ${name}:\n` + contents.slice(0, contents.indexOf("\n")),
+        );
+      const paramString = paramMatch[1];
       const params =
         paramString.trim().length === 0 ? [] : paramString.split(",").map(x => x.replace(/:.+$/, "").trim());
       if (params[0] === "this") {
         params.shift();
       }
 
-      const { result, rest } = sliceSourceCode(contents.slice(declaration[0].length - 1), true, x =>
+      const { result, rest } = sliceSourceCode(remaining.slice(paramMatch[0].length - 1), true, x =>
         globalThis.requireTransformer(x, SRC_DIR + "/" + basename),
       );
+
+      const source = result.trim().slice(2, -1);
+      const constEnumsUsedInFunction: string[] = [];
+      if (topLevelEnums.length) {
+        // If the function references a top-level const enum let's add the code
+        // to the top-level scope of the function so that the transpiler will
+        // inline all the values and strip out the enum object.
+        for (const { name, code } of topLevelEnums) {
+          // Only include const enums which are referenced in the function source.
+          if (source.includes(name)) {
+            constEnumsUsedInFunction.push(code);
+          }
+        }
+      }
 
       functions.push({
         name,
         params,
         directives,
-        source: result.trim().slice(2, -1),
+        source,
         async,
+        enums: constEnumsUsedInFunction,
       });
       contents = rest;
       directives = {};
@@ -160,18 +319,19 @@ async function processFileSplit(filename: string): Promise<{ functions: BundledB
 
   for (const fn of functions) {
     const tmpFile = path.join(TMP_DIR, `${basename}.${fn.name}.ts`);
+    assertNoStoredFunctionBehindComma(fn.source, `${basename}.ts (${fn.name})`);
 
     // not sure if this optimization works properly in jsc builtins
     // const useThis = fn.usesThis;
     const useThis = true;
 
     // TODO: we should use format=IIFE so we could bundle imports and extra functions.
-    await Bun.write(
+    writeFileSync(
       tmpFile,
       `// @ts-nocheck
 // GENERATED TEMP FILE - DO NOT EDIT
 // Sourced from ${path.relative(TMP_DIR, filename)}
-
+${fn.enums.join("\n")}
 // do not allow the bundler to rename a symbol to $
 ($);
 
@@ -186,28 +346,29 @@ $$capture_start$$(${fn.async ? "async " : ""}${
     const build = await Bun.build({
       entrypoints: [tmpFile],
       define,
-      minify: { syntax: true, whitespace: false },
+      target: "bun",
+      minify: { syntax: true, whitespace: false, keepNames: true },
     });
+    // TODO: Wait a few versions before removing this
     if (!build.success) {
       throw new AggregateError(build.logs, "Failed bundling builtin function " + fn.name + " from " + basename + ".ts");
     }
     if (build.outputs.length !== 1) {
       throw new Error("expected one output");
     }
-    const output = await build.outputs[0].text();
+    let output = (await build.outputs[0].text()).replaceAll("// @bun\n", "");
+    assertNoDestructuredGlobalThis(output, `${basename}.ts (${fn.name})`);
     let usesDebug = output.includes("$debug_log");
     let usesAssert = output.includes("$assert");
     const captured = output.match(/\$\$capture_start\$\$([\s\S]+)\.\$\$capture_end\$\$/)![1];
     const finalReplacement =
-      (fn.directives.sloppy
-        ? captured
-        : captured.replace(
-            /function\s*\(.*?\)\s*{/,
-            '$&"use strict";' +
-              (usesDebug ? createLogClientJS("BUILTINS", fn.name) : "") +
-              (usesAssert ? createAssertClientJS(fn.name) : ""),
-          )
-      )
+      captured
+        .replace(
+          /function\s*\(.*?\)\s*{/,
+          '$&"use strict";' +
+            (usesDebug ? createLogClientJS("BUILTINS", fn.name) : "") +
+            (usesAssert ? createAssertClientJS(fn.name) : ""),
+        )
         .replace(/^\((async )?function\(/, "($1function (")
         .replace(/__intrinsic__/g, "@")
         .replace(/__no_intrinsic__/g, "") + "\n";
@@ -222,12 +383,14 @@ $$capture_start$$(${fn.async ? "async " : ""}${
       directives: fn.directives,
       source: finalReplacement,
       params: fn.params,
-      visibility: fn.directives.visibility ?? (fn.directives.linkTimeConstant ? "Private" : "Public"),
-      isGetter: !!fn.directives.getter,
+      // Async functions automatically get Private visibility because the parser
+      // upgrades them when they use await (see Parser.cpp parseFunctionBody)
+      visibility: fn.directives.visibility ?? (fn.directives.linkTimeConstant || fn.async ? "Private" : "Public"),
       constructAbility: fn.directives.ConstructAbility ?? "CannotConstruct",
-      constructKind: fn.directives.ConstructKind ?? "None",
-      isLinkTimeConstant: !!fn.directives.linkTimeConstant,
-      intrinsic: fn.directives.intrinsic ?? "NoIntrinsic",
+
+      // Not known yet.
+      sourceOffset: 0,
+
       overriddenName: fn.directives.getter
         ? `"get ${fn.name}"_s`
         : fn.directives.overriddenName
@@ -237,7 +400,7 @@ $$capture_start$$(${fn.async ? "async " : ""}${
   }
 
   return {
-    functions: bundledFunctions.sort((a, b) => a.name.localeCompare(b.name)),
+    functions: bundledFunctions.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)),
     internal,
   };
 }
@@ -248,7 +411,7 @@ async function processFunctionFile(x: string) {
   try {
     files.push({
       basename,
-      ...(await processFileSplit(path.join(SRC_DIR, x))),
+      ...(await processFileSplit(x)),
     });
   } catch (error) {
     console.error("Failed to process file: " + basename + ".ts");
@@ -259,12 +422,13 @@ async function processFunctionFile(x: string) {
 
 interface BundleBuiltinFunctionsArgs {
   requireTransformer: (x: string, filename: string) => string;
+  /** Where WebCoreJSBuiltins.d.ts goes. */
+  typesDir: string;
 }
 
-export async function bundleBuiltinFunctions({ requireTransformer }: BundleBuiltinFunctionsArgs) {
-  const filesToProcess = readdirSync(SRC_DIR)
-    .filter(x => x.endsWith(".ts") && !x.endsWith(".d.ts"))
-    .sort();
+export async function bundleBuiltinFunctions({ requireTransformer, typesDir }: BundleBuiltinFunctionsArgs) {
+  mkdirSync(TMP_DIR, { recursive: true });
+  const filesToProcess = [...builtinFunctionFiles(SRC_DIR).values()];
 
   // Bun seems to crash if this is parallelized, :(
   if (PARALLEL) {
@@ -275,6 +439,44 @@ export async function bundleBuiltinFunctions({ requireTransformer }: BundleBuilt
     }
   }
 
+  let combinedSourceCode = "";
+  // Compute source offsets
+  {
+    for (const { basename, functions } of files) {
+      for (const fn of functions) {
+        checkAscii(fn.source);
+        fn.sourceOffset = combinedSourceCode.length;
+        combinedSourceCode += fn.source;
+
+        // If you want to see the individual function sources:
+        // if (true) {
+        //   Bun.write(CODEGEN_DIR + "/functions/" + low(basename) + cap(fn.name) + ".js", fn.source + "\n");
+        // }
+      }
+    }
+  }
+  const combinedSourceCodeLength = combinedSourceCode.length;
+
+  let additionalPrivateNames = new Set();
+
+  function privateName(name) {
+    additionalPrivateNames.add(name);
+    return "builtinNames." + name + "PrivateName()";
+  }
+
+  const ids = builtinFunctionIds(SRC_DIR);
+  const idOf = (basename: string, name: string) => {
+    const id = ids.get(`${basename}.ts\t${name}`);
+    if (id === undefined) throw new Error(`${basename}.ts: no id was assigned to the built-in function ${name}`);
+    return id;
+  };
+  files
+    .flatMap(({ basename, functions }) => functions.map(fn => idOf(basename, fn.name)))
+    .forEach((id, index) => {
+      if (id !== firstBuiltinFunctionId + index)
+        throw new Error("The built-in functions must follow each other in the combined text in the order of their ids");
+    });
+
   // C++ codegen
   let bundledCPP = `// Generated by ${import.meta.path}
     namespace Zig { class GlobalObject; }
@@ -282,49 +484,101 @@ export async function bundleBuiltinFunctions({ requireTransformer }: BundleBuilt
     #include "config.h"
     #include "JSDOMGlobalObject.h"
     #include "WebCoreJSClientData.h"
+    #include "WebCoreJSBuiltins.h"
+    #include <JavaScriptCore/AOTHost.h>
     #include <JavaScriptCore/JSObjectInlines.h>
-    
+    #include "BunBuiltinNames.h"
+
+    // The builtin function sources are linked at the start of bun_internal_modules_data
+    // (see bundle-modules.ts / InternalModuleRegistryConstants.S).
+    extern "C" const char bun_internal_modules_data[];
+
+    extern "C" const char* Bun__textOfBuiltinFunctions()
+    {
+        ${beginGuardedBody(removableFeatures(), "BuiltinSourceText", "ReturnDefault", "const char*")}
+        return WTF::opaque(static_cast<const char*>(bun_internal_modules_data));
+        ${endGuardedBody}
+    }
+
     namespace WebCore {
-    
     `;
 
   for (const { basename, functions } of files) {
-    bundledCPP += `/* ${basename}.ts */\n`;
+    bundledCPP += `
+#pragma mark ${basename}
+`;
+
     const lowerBasename = low(basename);
     for (const fn of functions) {
-      const [code, count] = fmtCPPCharArray(fn.source, true);
-      const name = `${lowerBasename}${cap(fn.name)}Code`;
-      bundledCPP += `// ${fn.name}
-    const JSC::ConstructAbility s_${name}ConstructAbility = JSC::ConstructAbility::${fn.constructAbility};
-    const JSC::InlineAttribute s_${name}InlineAttribute = JSC::InlineAttribute::${
-      fn.directives.alwaysInline ? "Always" : "None"
-    };
-    const JSC::ConstructorKind s_${name}ConstructorKind = JSC::ConstructorKind::${fn.constructKind};
-    const JSC::ImplementationVisibility s_${name}ImplementationVisibility = JSC::ImplementationVisibility::${
-      fn.visibility
-    };
-    const int s_${name}Length = ${fn.source.length};
-    const JSC::Intrinsic s_${name}Intrinsic = JSC::NoIntrinsic;
-    const char s_${name}Bytes[${count}] = ${code};
-    const char* s_${name} = s_${name}Bytes;
-    `;
+      const linkFromText = `link${cap(basename)}${cap(fn.name)}FromText`;
+      bundledCPP += `
+static JSC::FunctionExecutable* ${linkFromText}(JSC::VM& vm)
+{
+    auto &builtins = static_cast<JSVMClientData*>(vm.clientData)->builtinFunctions().${lowerBasename}Builtins();
+    auto *executable = builtins.${lowerBasename}${cap(fn.name)}CodeExecutable();
+    return executable->link(vm, nullptr, builtins.${lowerBasename}${cap(fn.name)}CodeSource(), std::nullopt, JSC::NoIntrinsic);
+}
+
+JSC::BuiltinCode ${lowerBasename}${cap(fn.name)}CodeGenerator(JSC::VM& vm)
+{
+#if ENABLE(AOT)
+    if (JSC::AOT::Image::isRegistered() && JSC::AOT::hasBuiltinFunction(vm, ${idOf(basename, fn.name)}))
+        return { nullptr, ${idOf(basename, fn.name)}, ${linkFromText} };
+#endif
+    return { ${linkFromText}(vm), 0 };
+}
+`;
     }
-    bundledCPP += `#define DEFINE_BUILTIN_GENERATOR(codeName, functionName, overriddenName, argumentCount) \\
-    JSC::FunctionExecutable* codeName##Generator(JSC::VM& vm) \\
-    {\\
-        JSVMClientData* clientData = static_cast<JSVMClientData*>(vm.clientData); \\
-        return clientData->builtinFunctions().${lowerBasename}Builtins().codeName##Executable()->link(vm, nullptr, clientData->builtinFunctions().${lowerBasename}Builtins().codeName##Source(), std::nullopt, s_##codeName##Intrinsic); \\
+  }
+
+  const initializeSourceCodeFn = (fn: BundledBuiltin, basename: string) => {
+    const name = `${low(basename)}${cap(fn.name)}CodeSource`;
+    return `m_${name}(SourceCode(sourceProvider.copyRef(), ${fn.sourceOffset}, ${fn.source.length + fn.sourceOffset}))`;
+  };
+  for (const { basename, internal, functions } of files) {
+    bundledCPP += `
+#pragma mark ${basename}
+
+${basename}BuiltinsWrapper::${basename}BuiltinsWrapper(JSC::VM& vm, RefPtr<JSC::SourceProvider> sourceProvider, BunBuiltinNames &builtinNames)
+    : m_vm(vm)`;
+
+    if (internal) {
+      bundledCPP += `, ${functions.map(fn => `m_${fn.name}PrivateName(${privateName(fn.name)})`).join(",\n   ")}`;
     }
-    WEBCORE_FOREACH_${basename.toUpperCase()}_BUILTIN_CODE(DEFINE_BUILTIN_GENERATOR)
-    #undef DEFINE_BUILTIN_GENERATOR
-    
-    `;
+    bundledCPP += `, ${functions.map(fn => initializeSourceCodeFn(fn, basename)).join(",\n   ")} {}
+`;
   }
 
   bundledCPP += `
-    
-    JSBuiltinInternalFunctions::JSBuiltinInternalFunctions(JSC::VM& vm)
-        : m_vm(vm)
+static constexpr unsigned internalCombinedSourceStarts[] = { ${files.flatMap(({ functions }) => functions.map(fn => fn.sourceOffset)).join(", ")} };
+
+RefPtr<JSC::SourceProvider> createBuiltinsSourceProvider() {
+    return JSC::BuiltinsSourceProvider::create(StringImpl::createWithoutCopying(std::span { reinterpret_cast<const Latin1Character*>(Bun__textOfBuiltinFunctions()), ${combinedSourceCodeLength} }), internalCombinedSourceStarts, ${firstBuiltinFunctionId});
+}
+`;
+
+  bundledCPP += `
+JSBuiltinFunctions::JSBuiltinFunctions(JSC::VM& vm, RefPtr<JSC::SourceProvider> provider, BunBuiltinNames& builtinNames) : m_vm(vm),
+  ${files.map(({ basename }) => `m_${low(basename)}Builtins(vm, provider, builtinNames)`).join(", ")}
+{}
+
+void JSBuiltinFunctions::exportNames() {
+`;
+
+  for (const { basename, internal } of files) {
+    if (internal) {
+      bundledCPP += `     m_${low(basename)}Builtins.exportNames();\n`;
+    }
+  }
+
+  bundledCPP += `
+}
+
+`;
+
+  bundledCPP += `
+
+JSBuiltinInternalFunctions::JSBuiltinInternalFunctions(JSC::VM& vm) : m_vm(vm)
     `;
 
   for (const { basename, internal } of files) {
@@ -333,11 +587,10 @@ export async function bundleBuiltinFunctions({ requireTransformer }: BundleBuilt
     }
   }
 
-  bundledCPP += `
-    {
-        UNUSED_PARAM(vm);
-    }
-    
+  bundledCPP += `{
+      UNUSED_PARAM(vm);
+  }
+
     template<typename Visitor>
     void JSBuiltinInternalFunctions::visit(Visitor& visitor)
     {
@@ -349,10 +602,20 @@ export async function bundleBuiltinFunctions({ requireTransformer }: BundleBuilt
   bundledCPP += `
         UNUSED_PARAM(visitor);
     }
-    
+
     template void JSBuiltinInternalFunctions::visit(AbstractSlotVisitor&);
     template void JSBuiltinInternalFunctions::visit(SlotVisitor&);
-    
+    `;
+
+  for (const { basename, internal } of files) {
+    if (internal) {
+      bundledCPP += `    template void ${basename}BuiltinFunctions::visit(JSC::AbstractSlotVisitor&);
+    template void ${basename}BuiltinFunctions::visit(JSC::SlotVisitor&);
+`;
+    }
+  }
+
+  bundledCPP += `
     SUPPRESS_ASAN void JSBuiltinInternalFunctions::initialize(Zig::GlobalObject& globalObject)
     {
         UNUSED_PARAM(globalObject);
@@ -382,10 +645,10 @@ export async function bundleBuiltinFunctions({ requireTransformer }: BundleBuilt
 
   bundledCPP += `
         };
-        globalObject.addStaticGlobals(staticGlobals, std::size(staticGlobals));
+        globalObject.addStaticGlobals(staticGlobals);
         UNUSED_PARAM(clientData);
     }
-    
+
     } // namespace WebCore
     `;
 
@@ -401,11 +664,11 @@ export async function bundleBuiltinFunctions({ requireTransformer }: BundleBuilt
     #include <JavaScriptCore/UnlinkedFunctionExecutable.h>
     #include <JavaScriptCore/VM.h>
     #include <JavaScriptCore/WeakInlines.h>
-    
+
     namespace JSC {
     class FunctionExecutable;
     }
-    
+
     namespace WebCore {
     `;
   for (const { basename, functions, internal } of files) {
@@ -417,13 +680,12 @@ export async function bundleBuiltinFunctions({ requireTransformer }: BundleBuilt
       const name = `${lowerBasename}${cap(fn.name)}Code`;
       bundledHeader += `// ${fn.name}
     #define WEBCORE_BUILTIN_${basename.toUpperCase()}_${fn.name.toUpperCase()} 1
-    extern const char* s_${name};
-    extern const int s_${name}Length;
-    extern const JSC::ConstructAbility s_${name}ConstructAbility;
-    extern const JSC::InlineAttribute s_${name}InlineAttribute;
-    extern const JSC::ConstructorKind s_${name}ConstructorKind;
-    extern const JSC::ImplementationVisibility s_${name}ImplementationVisibility;
-    
+    static constexpr JSC::ConstructAbility s_${name}ConstructAbility = JSC::ConstructAbility::${fn.constructAbility};
+    static constexpr JSC::InlineAttribute s_${name}InlineAttribute = JSC::InlineAttribute::${fn.directives.alwaysInline ? "Always" : "None"};
+    static constexpr JSC::ConstructorKind s_${name}ConstructorKind = JSC::ConstructorKind::None;
+    static constexpr JSC::ImplementationVisibility s_${name}ImplementationVisibility = JSC::ImplementationVisibility::${fn.visibility};
+    static constexpr JSC::BuiltinSourceMetadata s_${name}Metadata = { ${builtinSourceMetadata(fn.source).join(", ")} };
+
     `;
     }
     bundledHeader += `#define WEBCORE_FOREACH_${basename.toUpperCase()}_BUILTIN_DATA(macro) \\\n`;
@@ -443,45 +705,38 @@ export async function bundleBuiltinFunctions({ requireTransformer }: BundleBuilt
     }
     bundledHeader += `
     #define DECLARE_BUILTIN_GENERATOR(codeName, functionName, overriddenName, argumentCount) \\
-        JSC::FunctionExecutable* codeName##Generator(JSC::VM&);
-    
+        JSC::BuiltinCode codeName##Generator(JSC::VM&);
+
     WEBCORE_FOREACH_${basename.toUpperCase()}_BUILTIN_CODE(DECLARE_BUILTIN_GENERATOR)
     #undef DECLARE_BUILTIN_GENERATOR
-    
+
     class ${basename}BuiltinsWrapper : private JSC::WeakHandleOwner {
     public:
-        explicit ${basename}BuiltinsWrapper(JSC::VM& vm)
-            : m_vm(vm)
-            WEBCORE_FOREACH_${basename.toUpperCase()}_BUILTIN_FUNCTION_NAME(INITIALIZE_BUILTIN_NAMES)
-    #define INITIALIZE_BUILTIN_SOURCE_MEMBERS(name, functionName, overriddenName, length) , m_##name##Source(JSC::makeSource(StringImpl::createWithoutCopying({reinterpret_cast<const LChar*>(s_##name), static_cast<size_t>(length)}), { }, JSC::SourceTaintedOrigin::Untainted))
-            WEBCORE_FOREACH_${basename.toUpperCase()}_BUILTIN_CODE(INITIALIZE_BUILTIN_SOURCE_MEMBERS)
-    #undef INITIALIZE_BUILTIN_SOURCE_MEMBERS
-        {
-        }
-    
+        explicit ${basename}BuiltinsWrapper(JSC::VM& vm, RefPtr<JSC::SourceProvider> sourceProvider, BunBuiltinNames &builtinNames);
+
     #define EXPOSE_BUILTIN_EXECUTABLES(name, functionName, overriddenName, length) \\
         JSC::UnlinkedFunctionExecutable* name##Executable(); \\
         const JSC::SourceCode& name##Source() const { return m_##name##Source; }
         WEBCORE_FOREACH_${basename.toUpperCase()}_BUILTIN_CODE(EXPOSE_BUILTIN_EXECUTABLES)
     #undef EXPOSE_BUILTIN_EXECUTABLES
-    
+
         WEBCORE_FOREACH_${basename.toUpperCase()}_BUILTIN_FUNCTION_NAME(DECLARE_BUILTIN_IDENTIFIER_ACCESSOR)
-    
+
         void exportNames();
-    
+
     private:
-        JSC::VM& m_vm;
-    
+        [[maybe_unused]] JSC::VM& m_vm;
+
         WEBCORE_FOREACH_${basename.toUpperCase()}_BUILTIN_FUNCTION_NAME(DECLARE_BUILTIN_NAMES)
-    
+
     #define DECLARE_BUILTIN_SOURCE_MEMBERS(name, functionName, overriddenName, length) \\
         JSC::SourceCode m_##name##Source;\\
         JSC::Weak<JSC::UnlinkedFunctionExecutable> m_##name##Executable;
         WEBCORE_FOREACH_${basename.toUpperCase()}_BUILTIN_CODE(DECLARE_BUILTIN_SOURCE_MEMBERS)
     #undef DECLARE_BUILTIN_SOURCE_MEMBERS
-    
+
     };
-    
+
     #define DEFINE_BUILTIN_EXECUTABLES(name, functionName, overriddenName, length) \\
     inline JSC::UnlinkedFunctionExecutable* ${basename}BuiltinsWrapper::name##Executable() \\
     {\\
@@ -489,13 +744,13 @@ export async function bundleBuiltinFunctions({ requireTransformer }: BundleBuilt
             JSC::Identifier executableName = functionName##PublicName();\\
             if (overriddenName)\\
                 executableName = JSC::Identifier::fromString(m_vm, overriddenName);\\
-            m_##name##Executable = JSC::Weak<JSC::UnlinkedFunctionExecutable>(JSC::createBuiltinExecutable(m_vm, m_##name##Source, executableName, s_##name##ImplementationVisibility, s_##name##ConstructorKind, s_##name##ConstructAbility, s_##name##InlineAttribute), this, &m_##name##Executable);\\
+            m_##name##Executable = JSC::Weak<JSC::UnlinkedFunctionExecutable>(JSC::createBuiltinExecutable(m_vm, m_##name##Source, s_##name##Metadata, executableName, s_##name##ImplementationVisibility, s_##name##ConstructorKind, s_##name##ConstructAbility, s_##name##InlineAttribute), this, &m_##name##Executable);\\
         }\\
         return m_##name##Executable.get();\\
     }
     WEBCORE_FOREACH_${basename.toUpperCase()}_BUILTIN_CODE(DEFINE_BUILTIN_EXECUTABLES)
     #undef DEFINE_BUILTIN_EXECUTABLES
-    
+
     inline void ${basename}BuiltinsWrapper::exportNames()
     {
     #define EXPORT_FUNCTION_NAME(name) m_vm.propertyNames->appendExternalName(name##PublicName(), name##PrivateName());
@@ -508,27 +763,27 @@ export async function bundleBuiltinFunctions({ requireTransformer }: BundleBuilt
       bundledHeader += `class ${basename}BuiltinFunctions {
     public:
         explicit ${basename}BuiltinFunctions(JSC::VM& vm) : m_vm(vm) { }
-    
+
         void init(JSC::JSGlobalObject&);
         template<typename Visitor> void visit(Visitor&);
-    
+
     public:
-        JSC::VM& m_vm;
-    
+        [[maybe_unused]] JSC::VM& m_vm;
+
     #define DECLARE_BUILTIN_SOURCE_MEMBERS(functionName) \\
         JSC::WriteBarrier<JSC::JSFunction> m_##functionName##Function;
         WEBCORE_FOREACH_${basename.toUpperCase()}_BUILTIN_FUNCTION_NAME(DECLARE_BUILTIN_SOURCE_MEMBERS)
     #undef DECLARE_BUILTIN_SOURCE_MEMBERS
     };
-    
+
     inline void ${basename}BuiltinFunctions::init(JSC::JSGlobalObject& globalObject)
     {
     #define EXPORT_FUNCTION(codeName, functionName, overriddenName, length) \\
-        m_##functionName##Function.set(m_vm, &globalObject, JSC::JSFunction::create(m_vm, codeName##Generator(m_vm), &globalObject));
+        m_##functionName##Function.set(m_vm, &globalObject, JSC::JSFunction::create(m_vm, &globalObject, codeName##Generator(m_vm), &globalObject));
         WEBCORE_FOREACH_${basename.toUpperCase()}_BUILTIN_CODE(EXPORT_FUNCTION)
     #undef EXPORT_FUNCTION
     }
-    
+
     template<typename Visitor>
     inline void ${basename}BuiltinFunctions::visit(Visitor& visitor)
     {
@@ -536,33 +791,18 @@ export async function bundleBuiltinFunctions({ requireTransformer }: BundleBuilt
         WEBCORE_FOREACH_${basename.toUpperCase()}_BUILTIN_FUNCTION_NAME(VISIT_FUNCTION)
     #undef VISIT_FUNCTION
     }
-    
-    template void ${basename}BuiltinFunctions::visit(JSC::AbstractSlotVisitor&);
-    template void ${basename}BuiltinFunctions::visit(JSC::SlotVisitor&);
+
+    extern template void ${basename}BuiltinFunctions::visit(JSC::AbstractSlotVisitor&);
+    extern template void ${basename}BuiltinFunctions::visit(JSC::SlotVisitor&);
         `;
     }
   }
   bundledHeader += `class JSBuiltinFunctions {
+        WTF_DEPRECATED_MAKE_FAST_ALLOCATED(JSBuiltinFunctions);
     public:
-        explicit JSBuiltinFunctions(JSC::VM& vm)
-            : m_vm(vm)
-    `;
+        explicit JSBuiltinFunctions(JSC::VM& vm, RefPtr<JSC::SourceProvider> provider, BunBuiltinNames &builtinNames);
+        void exportNames();
 
-  for (const { basename } of files) {
-    bundledHeader += `        , m_${low(basename)}Builtins(m_vm)\n`;
-  }
-
-  bundledHeader += `
-      {
-    `;
-
-  for (const { basename, internal } of files) {
-    if (internal) {
-      bundledHeader += `        m_${low(basename)}Builtins.exportNames();\n`;
-    }
-  }
-
-  bundledHeader += `    }
     `;
 
   for (const { basename } of files) {
@@ -573,7 +813,7 @@ export async function bundleBuiltinFunctions({ requireTransformer }: BundleBuilt
 
   bundledHeader += `
     private:
-        JSC::VM& m_vm;
+        [[maybe_unused]] JSC::VM& m_vm;
     `;
 
   for (const { basename } of files) {
@@ -582,11 +822,12 @@ export async function bundleBuiltinFunctions({ requireTransformer }: BundleBuilt
 
   bundledHeader += `;
     };
-    
+
     class JSBuiltinInternalFunctions {
+        WTF_DEPRECATED_MAKE_FAST_ALLOCATED(JSBuiltinInternalFunctions);
     public:
         explicit JSBuiltinInternalFunctions(JSC::VM&);
-    
+
         template<typename Visitor> void visit(Visitor&);
         void initialize(Zig::GlobalObject&);
     `;
@@ -599,7 +840,7 @@ export async function bundleBuiltinFunctions({ requireTransformer }: BundleBuilt
 
   bundledHeader += `
     private:
-        JSC::VM& m_vm;
+        [[maybe_unused]] JSC::VM& m_vm;
     `;
 
   for (const { basename, internal } of files) {
@@ -610,10 +851,58 @@ export async function bundleBuiltinFunctions({ requireTransformer }: BundleBuilt
 
   bundledHeader += `
     };
-    
+
     } // namespace WebCore
     `;
+  // Handle builtin names
+  let privateNames: string[];
+  {
+    const BunBuiltinNamesHeader = require("fs").readFileSync(
+      path.join(import.meta.dir, "../js/builtins/BunBuiltinNames.h"),
+      "utf8",
+    );
+    let definedBuiltinNamesStartI = BunBuiltinNamesHeader.indexOf(
+      "#define BUN_COMMON_PRIVATE_IDENTIFIERS_EACH_PROPERTY_NAME",
+    );
+    let definedBuiltinNamesMacroEndI = BunBuiltinNamesHeader.indexOf(
+      "--- END of BUN_COMMON_PRIVATE_IDENTIFIERS_EACH_PROPERTY_NAME ---",
+    );
+    const definedBuiltinNames = BunBuiltinNamesHeader.slice(definedBuiltinNamesStartI, definedBuiltinNamesMacroEndI)
+      .split("\n")
+      .map(x => x.trim())
+      .filter(x => x.startsWith("macro("))
+      .map(x => x.slice(x.indexOf("(") + 1, x.indexOf(")")))
+      .map(x => x.trim())
+      .sort();
 
+    const uniqueDefinedBuiltinNames = new Set();
+    for (let name of definedBuiltinNames) {
+      const prevSize = uniqueDefinedBuiltinNames.size;
+      uniqueDefinedBuiltinNames.add(name);
+      if (uniqueDefinedBuiltinNames.size === prevSize) {
+        throw new Error(`Duplicate private name "${name}" in BunBuiltinNames.h`);
+      }
+    }
+    for (let additionalPrivateName of additionalPrivateNames) {
+      if (uniqueDefinedBuiltinNames.has(additionalPrivateName)) {
+        additionalPrivateNames.delete(additionalPrivateName);
+      }
+    }
+
+    let additionalPrivateNamesHeader = `// Generated by ${import.meta.path}
+#pragma once
+
+#ifndef BUN_ADDITIONAL_BUILTIN_NAMES
+#define BUN_ADDITIONAL_BUILTIN_NAMES(macro) \\
+  ${Array.from(additionalPrivateNames)
+    .map(x => `macro(${x})`)
+    .join(" \\\n  ")}
+#endif
+`;
+
+    writeIfNotChanged(path.join(CODEGEN_DIR, "BunBuiltinNames+extras.h"), additionalPrivateNamesHeader);
+    privateNames = [...definedBuiltinNames, ...(additionalPrivateNames as Set<string>)];
+  }
   writeIfNotChanged(path.join(CODEGEN_DIR, "WebCoreJSBuiltins.h"), bundledHeader);
   writeIfNotChanged(path.join(CODEGEN_DIR, "WebCoreJSBuiltins.cpp"), bundledCPP);
 
@@ -628,7 +917,7 @@ export async function bundleBuiltinFunctions({ requireTransformer }: BundleBuilt
       dts += `\n// ${basename}.ts\n`;
       for (const fn of functions) {
         dts += `declare const \$${fn.name}: RemoveThis<typeof import("${path.relative(
-          CODEGEN_DIR,
+          typesDir,
           path.join(SRC_DIR, basename),
         )}")[${JSON.stringify(fn.name)}]>;\n`;
       }
@@ -637,7 +926,7 @@ export async function bundleBuiltinFunctions({ requireTransformer }: BundleBuilt
 
   dts += getJS2NativeDTS();
 
-  writeIfNotChanged(path.join(CODEGEN_DIR, "WebCoreJSBuiltins.d.ts"), dts);
+  writeIfNotChanged(path.join(typesDir, "WebCoreJSBuiltins.d.ts"), dts);
 
   const totalJSSize = files.reduce(
     (acc, { functions }) => acc + functions.reduce((acc, fn) => acc + fn.source.length, 0),
@@ -651,4 +940,9 @@ export async function bundleBuiltinFunctions({ requireTransformer }: BundleBuilt
   globalThis.internalFunctionJSSize = totalJSSize;
   globalThis.internalFunctionCount = files.reduce((acc, { functions }) => acc + functions.length, 0);
   globalThis.internalFunctionFileCount = files.length;
+
+  // bundle-modules.ts prepends this to InternalModuleRegistryConstants.bin so the
+  // same linked blob carries both the builtin function sources and the internal
+  // module sources. `privateNames` lists every private name registered by BunBuiltinNames.
+  return { combinedSourceCode, privateNames };
 }

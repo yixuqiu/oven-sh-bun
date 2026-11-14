@@ -1,14 +1,26 @@
-import { afterAll, beforeAll, expect, test } from "bun:test";
-import { bunEnv, bunExe } from "../../../harness";
 import { Subprocess } from "bun";
+import { install_test_helpers } from "bun:internal-for-testing";
+import { afterAll, beforeAll, expect, test } from "bun:test";
 import { copyFileSync } from "fs";
+import { cp, rm } from "fs/promises";
 import { join } from "path";
 import { StringDecoder } from "string_decoder";
-import { cp, rm } from "fs/promises";
+import {
+  bunEnv,
+  bunExe,
+  getPuppeteerInstallEnv,
+  isCI,
+  isWindows,
+  tmpdirSync,
+  toMatchNodeModulesAt,
+} from "../../../harness";
+const { parseLockfile } = install_test_helpers;
 
-import { tmpdir } from "node:os";
+expect.extend({ toMatchNodeModulesAt });
 
-let root = join(tmpdir(), "next-pages" + Math.random().toString(36).slice(2) + "-" + Date.now().toString(36));
+let root = tmpdirSync();
+
+const puppeteerInstallEnv = getPuppeteerInstallEnv();
 
 beforeAll(async () => {
   await rm(root, { recursive: true, force: true });
@@ -32,7 +44,7 @@ async function getDevServerURL() {
     },
     stdio: ["ignore", "pipe", "inherit"],
   });
-  dev_server.stdout?.unref?.();
+  (dev_server.stdout as any)?.unref?.();
   var hasLoaded = false;
   dev_server_pid = dev_server.pid;
 
@@ -57,16 +69,18 @@ async function getDevServerURL() {
   async function readStream() {
     const string_decoder = new StringDecoder("utf-8");
     const stdout = dev_server!.stdout!;
+    let accumulated = "";
     for await (const chunk of stdout) {
       const str = string_decoder.write(chunk);
       console.error(str);
 
       if (!hasLoaded) {
-        let match = str.match(/http:\/\/localhost:\d+/);
+        accumulated += str;
+        let match = accumulated.match(/http:\/\/localhost:\d+/);
         if (match) {
           baseUrl = match[0];
         }
-        if (str.toLowerCase().includes("ready")) {
+        if (accumulated.toLowerCase().includes("ready") && baseUrl) {
           hasLoaded = true;
           loaded();
         }
@@ -77,7 +91,7 @@ async function getDevServerURL() {
   readStream()
     .catch(e => reject(e))
     .finally(() => {
-      dev_server.unref?.();
+      dev_server?.unref?.();
     });
   await promise;
   return baseUrl;
@@ -86,15 +100,31 @@ async function getDevServerURL() {
 beforeAll(async () => {
   copyFileSync(join(root, "src/Counter1.txt"), join(root, "src/Counter.tsx"));
 
+  // Skip the browser download inside `bun i`: puppeteer is default-trusted so
+  // install.mjs would otherwise run twice against the same cache, and the first
+  // (silent) run has left a half-extracted chrome-headless-shell on macOS CI.
   const install = Bun.spawnSync([bunExe(), "i"], {
     cwd: root,
-    env: { ...bunEnv, BUN_INSTALL_CACHE_DIR: join(root, ".bun-install") },
+    env: { ...bunEnv, BUN_INSTALL_CACHE_DIR: join(root, ".bun-install"), PUPPETEER_SKIP_DOWNLOAD: "1" },
     stdout: "inherit",
     stderr: "inherit",
     stdin: "inherit",
   });
   if (!install.success) {
-    throw new Error("Failed to install dependencies");
+    const reason = install.signalCode || `code ${install.exitCode}`;
+    throw new Error(`Failed to install dependencies: ${reason}`);
+  }
+
+  const browserInstall = Bun.spawnSync([bunExe(), join("node_modules", "puppeteer", "install.mjs")], {
+    cwd: root,
+    env: { ...bunEnv, ...puppeteerInstallEnv },
+    stdout: "inherit",
+    stderr: "inherit",
+    stdin: "inherit",
+  });
+  if (!browserInstall.success) {
+    const reason = browserInstall.signalCode || `code ${browserInstall.exitCode}`;
+    throw new Error(`Failed to install puppeteer browser: ${reason}`);
   }
 
   try {
@@ -119,11 +149,17 @@ afterAll(() => {
 // https://github.com/puppeteer/puppeteer/issues/7740
 const puppeteer_unsupported = process.platform === "linux" && process.arch === "arm64";
 
-test.skipIf(puppeteer_unsupported)(
+// https://github.com/oven-sh/bun/issues/11255
+test.skipIf(puppeteer_unsupported || (isWindows && isCI))(
   "hot reloading works on the client (+ tailwind hmr)",
   async () => {
     expect(dev_server).not.toBeUndefined();
     expect(baseUrl).not.toBeUndefined();
+
+    const lockfile = parseLockfile(root);
+    expect(lockfile).toMatchNodeModulesAt(root);
+    expect(lockfile).toMatchSnapshot();
+
     var pid: number, exited;
     let timeout = setTimeout(() => {
       if (timeout && pid) {
@@ -135,11 +171,11 @@ test.skipIf(puppeteer_unsupported)(
           dev_server_pid = undefined;
         }
       }
-    }, 30000).unref();
+    }, 90000).unref();
 
     ({ exited, pid } = Bun.spawn([bunExe(), "test/dev-server-puppeteer.ts", baseUrl], {
       cwd: root,
-      env: bunEnv,
+      env: { ...bunEnv, ...puppeteerInstallEnv },
       stdio: ["ignore", "inherit", "inherit"],
     }));
 
@@ -149,5 +185,5 @@ test.skipIf(puppeteer_unsupported)(
     // @ts-expect-error
     timeout = undefined;
   },
-  30000,
+  100_000,
 );

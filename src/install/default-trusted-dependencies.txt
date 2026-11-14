@@ -1,4 +1,5 @@
 @airbnb/node-memwatch
+@anthropic-ai/claude-code
 @apollo/protobufjs
 @apollo/rover
 @appsignal/nodejs
@@ -91,7 +92,6 @@
 @splunk/otel
 @strapi/strapi
 @sveltejs/kit
-@swc/core
 @syncfusion/ej2-angular-base
 @taquito/taquito
 @temporalio/core-bridge
@@ -267,6 +267,7 @@ nodent-runtime
 nx
 odiff-bin
 oniguruma
+opencode-ai
 optipng-bin
 oracledb
 os-dns-native
@@ -359,7 +360,6 @@ wordpos
 workerd
 wrtc
 xxhash
-yarn
 yo
 yorkie
 zeromq

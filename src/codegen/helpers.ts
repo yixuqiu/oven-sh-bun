@@ -1,31 +1,7 @@
+import { isAscii } from "buffer";
+import { createHash } from "crypto";
 import fs from "fs";
 import path from "path";
-import { isAscii } from "buffer";
-
-// MSVC has a max of 16k characters per string literal
-// Combining string literals didn't support constexpr apparently
-// so we have to do this the gigantic array way
-export function fmtCPPCharArray(str: string, nullTerminated: boolean = true) {
-  const normalized = str + "\n";
-
-  var remain = normalized;
-
-  const chars =
-    "{" +
-    remain
-      .split("")
-      .map(a => a.charCodeAt(0))
-      .join(",") +
-    (nullTerminated ? ",0" : "") +
-    "}";
-  return [chars, normalized.length + (nullTerminated ? 1 : 0)];
-}
-
-export function declareASCIILiteral(name: string, value: string) {
-  const [chars, count] = fmtCPPCharArray(value, true);
-  return `static constexpr const char ${name}Bytes[${count}] = ${chars};
-static constexpr ASCIILiteral ${name} = ASCIILiteral::fromLiteralUnsafe(${name}Bytes);`;
-}
 
 export function cap(str: string) {
   return str[0].toUpperCase() + str.slice(1);
@@ -39,8 +15,13 @@ export function low(str: string) {
   return str[0].toLowerCase() + str.slice(1);
 }
 
+/** Every file under `root`, sorted by name in each directory. */
 export function readdirRecursive(root: string): string[] {
-  const files = fs.readdirSync(root, { withFileTypes: true });
+  // The order of readdirSync() depends on the runtime and the file system:
+  // node sorts the entries, and bun does not.
+  const files = fs
+    .readdirSync(root, { withFileTypes: true })
+    .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
   return files.flatMap(file => {
     const fullPath = path.join(root, file.name);
     return file.isDirectory() ? readdirRecursive(fullPath) : fullPath;
@@ -63,19 +44,55 @@ export function checkAscii(str: string) {
   return str;
 }
 
+/** The first four bytes of the SHA-256 digest of the sources, read as a big-endian u32. */
+export function sourceStamp(sources: Iterable<string>): number {
+  const hash = createHash("sha256");
+  for (const source of sources) hash.update(source);
+  return hash.digest().readUInt32BE(0);
+}
+
+/**
+ * Hashes the WebKit version and private names that a bun must share to compile the builtins section.
+ * Never returns 0, which means the section has no stamp.
+ */
+export function engineStamp(webkitVersion: string, privateNames: Iterable<string>): number {
+  return sourceStamp([webkitVersion, ...[...privateNames].sort()].map(part => part + "\n")) || 1;
+}
+
 export function writeIfNotChanged(file: string, contents: string) {
   if (Array.isArray(contents)) contents = contents.join("");
+  contents = contents.replaceAll("\r\n", "\n").trim() + "\n";
 
-  if (fs.existsSync(file)) {
+  try {
     const oldContents = fs.readFileSync(file, "utf8");
     if (oldContents === contents) {
       return;
     }
-  }
+  } catch (e) {}
 
+  // Through a rename, so a reader never sees half a file: the build directories of two profiles both write the
+  // declarations in build/types, and tsc or an editor may be reading them.
+  const temporary = `${file}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(temporary, contents);
+  } catch (error) {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(temporary, contents);
+  }
+  fs.renameSync(temporary, file);
+
+  if (fs.readFileSync(file, "utf8") !== contents) {
+    throw new Error(`Failed to write file ${file}`);
+  }
+}
+
+export function writeIfNotChangedBinary(file: string, contents: Buffer) {
+  try {
+    if (fs.readFileSync(file).equals(contents)) return;
+  } catch {}
   try {
     fs.writeFileSync(file, contents);
-  } catch (error) {
+  } catch {
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, contents);
   }
@@ -92,7 +109,7 @@ export function readdirRecursiveWithExclusionsAndExtensionsSync(
     const fullPath = path.join(dir, entry.name);
     return entry.isDirectory()
       ? readdirRecursiveWithExclusionsAndExtensionsSync(fullPath, exclusions, exts)
-      : exts.includes(path.extname(fullPath))
+      : exts.some(ext => fullPath.endsWith(ext))
         ? fullPath
         : [];
   });
@@ -104,4 +121,32 @@ export function pathToUpperSnakeCase(filepath: string) {
     .split(/[-_./\\]/g)
     .join("_")
     .toUpperCase();
+}
+
+export function argParse(keys: string[]): any {
+  const options: { [key: string]: boolean | string } = {};
+  for (const arg of process.argv.slice(2)) {
+    if (!arg.startsWith("--")) {
+      console.error("error: unknown argument: " + arg);
+      process.exit(1);
+    }
+    const splitPos = arg.indexOf("=");
+    let name = arg;
+    let value: boolean | string = true;
+    if (splitPos !== -1) {
+      name = arg.slice(0, splitPos);
+      value = arg.slice(splitPos + 1);
+    }
+    options[name.slice(2)] = value;
+  }
+
+  const unknown = new Set(Object.keys(options));
+  for (const key of keys) {
+    unknown.delete(key);
+  }
+  for (const key of unknown) {
+    console.error("error: unknown argument: --" + key);
+  }
+  if (unknown.size > 0) process.exit(1);
+  return options;
 }

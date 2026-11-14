@@ -1,4 +1,5 @@
-import { test, describe } from "bun:test";
+import { describe, test } from "bun:test";
+import { isWindows } from "harness";
 import assert from "node:assert";
 import path from "node:path";
 
@@ -35,6 +36,21 @@ describe("path.relative", () => {
           ["\\\\foo\\baz", "\\\\foo\\baz-quux", "..\\baz-quux"],
           ["C:\\baz", "\\\\foo\\bar\\baz", "\\\\foo\\bar\\baz"],
           ["\\\\foo\\bar\\baz", "C:\\baz", "C:\\baz"],
+          // Slash-rooted (no drive letter) inputs that hit the last_common_sep=Some(3) overshoot.
+          // win32.resolve pulls a device root from cwd, so expected values only hold on a POSIX host.
+          ...(isWindows
+            ? []
+            : [
+                ["/x..", "/x.", ""],
+                ["/xy.", "/xy", ""],
+                ["/abc", "/ab", ""],
+                ["\\x..", "\\x.", ""],
+                ["\\ab.", "\\ab", ""],
+                ["/xyz.", "/xy", ".."],
+                ["/xyzw", "/xy", ".."],
+                ["/abcde", "/ab", ".."],
+                ["/x.", "/x..", "."],
+              ]),
         ],
       ],
       [
@@ -73,5 +89,16 @@ describe("path.relative", () => {
       });
     });
     assert.strictEqual(failures.length, 0, failures.join(""));
+  });
+
+  test("very long paths", () => {
+    // Regression test: buffer overflow with very long paths
+    // This used to panic because the buffer didn't account for the null terminator
+    const longPath1 = "/home/" + "a".repeat(50000);
+    const longPath2 = "/home/" + "b".repeat(50000);
+    const result = path.relative(longPath1, longPath2);
+    // Should return something like "../bbb...bbb"
+    assert.ok(result.startsWith(".."));
+    assert.ok(result.includes("b"));
   });
 });

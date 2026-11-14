@@ -35,12 +35,12 @@ JSC_DEFINE_HOST_FUNCTION(jsFunctionWrite, (JSC::JSGlobalObject * globalObject,
   JSValue arg1 = callframe->argument(0);
   JSValue toWriteArg = callframe->argument(1);
   auto &vm = globalObject->vm();
-  auto scope = DECLARE_CATCH_SCOPE(vm);
+  auto scope = DECLARE_TOP_EXCEPTION_SCOPE(vm);
 
   int32_t fd = STDOUT_FILENO;
   if (callframe->argumentCount() > 1) {
     fd = arg1.toInt32(globalObject);
-    RETURN_IF_EXCEPTION(scope, encodedJSValue());
+    RETURN_IF_EXCEPTION(scope, {});
   } else {
     toWriteArg = arg1;
   }
@@ -53,7 +53,7 @@ JSC_DEFINE_HOST_FUNCTION(jsFunctionWrite, (JSC::JSGlobalObject * globalObject,
   }
 
   auto string = toWriteArg.toWTFString(globalObject);
-  RETURN_IF_EXCEPTION(scope, encodedJSValue());
+  RETURN_IF_EXCEPTION(scope, {});
   auto utf8 = string.utf8();
   auto length = utf8.length();
   auto written = write(fd, utf8.data(), length);
@@ -82,7 +82,7 @@ int main(int argc, char **argv) {
       JSC::Options::useSourceProviderCache() = true;
       // JSC::Options::useUnlinkedCodeBlockJettisoning() = false;
       JSC::Options::exposeInternalModuleLoader() = true;
-      JSC::Options::useSharedArrayBuffer() = true;
+      JSC::Options::alwaysUseSharedArrayBuffer() = true;
       JSC::Options::useJIT() = true;
       JSC::Options::useBBQJIT() = true;
       JSC::Options::useJITCage() = false;

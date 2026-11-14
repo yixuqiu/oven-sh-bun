@@ -1,7 +1,7 @@
 import assert from "assert";
+import { describe, expect } from "bun:test";
 import { readdirSync } from "fs";
-import { itBundled, testForFile } from "../expectBundled";
-var { describe, test, expect } = testForFile(import.meta.path);
+import { itBundled } from "../expectBundled";
 
 // Tests ported from:
 // https://github.com/evanw/esbuild/blob/main/internal/bundler_tests/bundler_splitting_test.go
@@ -279,7 +279,6 @@ describe("bundler", () => {
     },
   });
   itBundled("splitting/ReExportESBuildIssue273", {
-    todo: true,
     files: {
       "/a.js": `export const a = { value: 1 }`,
       "/b.js": `export { a } from './a'`,
@@ -513,9 +512,10 @@ describe("bundler", () => {
     entryPoints: ["/a.js", "/b.js", "/c.js"],
     splitting: true,
     minifyIdentifiers: true,
+    // `foo` crosses chunks, so it carries one bundle-wide minified name.
     run: [
-      { file: "/out/a.js", stdout: "[Function: f]" },
-      { file: "/out/b.js", stdout: "[Function: f]" },
+      { file: "/out/a.js", stdout: "[Function: o]" },
+      { file: "/out/b.js", stdout: "[Function: o]" },
     ],
   });
   itBundled("splitting/HybridESMAndCJSESBuildIssue617", {
@@ -609,4 +609,57 @@ describe("bundler", () => {
       stdout: "42 true 42",
     },
   });
+  // Test that CJS modules with dynamic imports to other CJS entry points work correctly
+  // when code splitting causes the dynamically imported module to be in a separate chunk.
+  // The dynamic import should properly unwrap the default export using __toESM.
+  // Regression test for: dynamic import of CJS chunk returns { default: { __esModule, ... } }
+  // and needs .then((m)=>__toESM(m.default)) to unwrap correctly.
+  // Note: __esModule is required because bun optimizes simple CJS to ESM otherwise.
+  itBundled("splitting/CJSDynamicImportOfCJSChunk", {
+    files: {
+      "/main.js": /* js */ `
+        import("./impl.js").then(mod => console.log(mod.foo()));
+      `,
+      "/impl.js": /* js */ `
+        Object.defineProperty(exports, "__esModule", { value: true });
+        exports.foo = () => "success";
+      `,
+    },
+    entryPoints: ["/main.js", "/impl.js"],
+    splitting: true,
+    outdir: "/out",
+    run: {
+      file: "/out/main.js",
+      stdout: "success",
+    },
+  });
+  // https://github.com/oven-sh/bun/issues/32395
+  for (const format of ["cjs", "iife"] as const) {
+    for (const backend of ["cli", "api"] as const) {
+      itBundled(`splitting/ErrorWithNonEsmFormat_${format}_${backend}`, {
+        files: {
+          "/shared.js": /* js */ `
+            export function sharedFn() { return "shared"; }
+            export const sharedConst = 42;
+          `,
+          "/a.js": /* js */ `
+            import { sharedFn, sharedConst } from "./shared";
+            export const a = sharedFn() + sharedConst;
+          `,
+          "/b.js": /* js */ `
+            import { sharedFn, sharedConst } from "./shared";
+            export const b = sharedFn() + sharedConst;
+          `,
+        },
+        entryPoints: ["/a.js", "/b.js"],
+        outdir: "/out",
+        splitting: true,
+        format,
+        backend,
+        bundleErrors: {
+          "<bun>": ['Code splitting is currently only supported when format is set to "esm"'],
+        },
+      });
+    }
+  }
 });

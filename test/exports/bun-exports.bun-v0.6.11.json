@@ -7645,6 +7645,7 @@
           "plugin": "function",
           "readableStreamToArray": "function",
           "readableStreamToArrayBuffer": "function",
+          "readableStreamToBytes": "function",
           "readableStreamToBlob": "function",
           "readableStreamToJSON": "function",
           "readableStreamToText": "function",
@@ -8596,7 +8597,7 @@
   "errors": {
     "node:wasi": {
       "name": "ReferenceError",
-      "message": "Can't find variable: constants"
+      "message": "constants is not defined"
     }
   }
 }

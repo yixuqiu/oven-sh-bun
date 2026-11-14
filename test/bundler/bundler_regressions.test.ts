@@ -1,9 +1,45 @@
-import assert from "assert";
-import dedent from "dedent";
-import { itBundled, testForFile } from "./expectBundled";
-var { describe, test, expect } = testForFile(import.meta.path);
+import { describe } from "bun:test";
+import { itBundled } from "./expectBundled";
 
 describe("bundler", () => {
+  // Exercises the bundler's chunking/linking internals end-to-end: code
+  // splitting produces cross-chunk imports (sorted deterministically), CSS is
+  // compiled into its own chunk, symbols are renamed across chunks, and every
+  // output is content-hashed. Keeps that machinery covered after the types that
+  // back it were relocated across the bundler crate.
+  itBundled("regression/SplittingWithSharedChunkAndCSS", {
+    files: {
+      "/entry.js": /* js */ `
+        import "./styles.css";
+        const { shared } = await import("./shared.js");
+        const { a } = await import("./a.js");
+        const { b } = await import("./b.js");
+        console.log(shared(), a(), b());
+      `,
+      "/shared.js": /* js */ `
+        export function shared() { return "shared"; }
+      `,
+      "/a.js": /* js */ `
+        import { shared } from "./shared.js";
+        export function a() { return shared() + "-a"; }
+      `,
+      "/b.js": /* js */ `
+        import { shared } from "./shared.js";
+        export function b() { return shared() + "-b"; }
+      `,
+      "/styles.css": `.x { color: red; }`,
+    },
+    entryPoints: ["/entry.js"],
+    splitting: true,
+    outdir: "/out",
+    target: "browser",
+    format: "esm",
+    run: {
+      file: "/out/entry.js",
+      stdout: "shared shared-a shared-b",
+    },
+  });
+
   // https://x.com/jeroendotdot/status/1740651288239460384?s=46&t=0Uhw6mmGT650_9M2pXUsCw
   itBundled("regression/PublicPathCLIFlagNotWorking", {
     files: {
@@ -215,5 +251,86 @@ describe("bundler", () => {
       `,
     },
     run: { stdout: "你好" },
+  });
+
+  itBundled("regression/WindowsBackslashAssertion1#9974", {
+    backend: "cli",
+    files: {
+      "/test/entry.ts": `
+        import { loadFonts } from "../base";
+        console.log(loadFonts);
+      `,
+    },
+    entryPointsRaw: ["test/entry.ts", "--external", "*"],
+  });
+
+  itBundled(`regression/NODE_PATHBuild cli`, {
+    files: {
+      "/entry.js": `
+        import MyClass from 'MyClass';
+        console.log(new MyClass().constructor.name);
+      `,
+      "/src/MyClass.js": `
+        export default class MyClass {}
+      `,
+    },
+    entryPoints: ["/entry.js"],
+    backend: "cli",
+    env: {
+      NODE_PATH: "{{root}}/src",
+    },
+    run: {
+      stdout: "MyClass",
+    },
+  });
+
+  itBundled("regression/NamespaceTracking#12337", {
+    files: {
+      "/entry.ts": /* ts */ `
+        (0, eval)('globalThis.ca' + 'pture = () => {};')
+
+        export namespace Test {
+          export function anInstance(): Test {
+            return {
+              level1: {
+                level2: {
+                  level3: Level1.Level2.Level3.anInstance(),
+                }
+              },
+            }
+          }
+ 
+          export namespace Level1 {
+            export namespace Level2 {
+              export function anInstance(): Level2 {
+                return {
+                  level3: Level3.anInstance(),
+                }
+              }
+              export enum Enum {
+                Value = 1,
+              }
+              export namespace Level3 {
+                export type Value = Level3['value']
+                export function anInstance(): Level3 {
+                  return {
+                    value: 'Hello, World!',
+                  }
+                }
+                capture(Enum.Value);
+              }
+            }
+            capture(Level2.Enum.Value);
+          }
+        }
+
+        if(Test.anInstance().level1.level2.level3.value !== 'Hello, World!')
+          throw new Error('fail')
+
+        capture(Test.Level1.Level2.Enum.Value);
+      `,
+    },
+    run: true,
+    capture: ["1 /* Value */", "1 /* Value */", "1 /* Value */"],
   });
 });

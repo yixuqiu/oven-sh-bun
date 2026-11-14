@@ -1,6 +1,6 @@
 /**
- * `bun:ffi` lets you efficiently call C functions & FFI functions from JavaScript
- *  without writing bindings yourself.
+ * `bun:ffi` calls C functions from JavaScript without requiring you to write
+ * bindings.
  *
  * ```js
  * import {dlopen, CString, ptr} from 'bun:ffi';
@@ -9,10 +9,7 @@
  * });
  * ```
  *
- * This is powered by just-in-time compiling C wrappers
- * that convert JavaScript types to C types and back. Internally,
- * bun uses [tinycc](https://github.com/TinyCC/tinycc), so a big thanks
- * goes to Fabrice Bellard and TinyCC maintainers for making this possible.
+ * @category FFI
  */
 declare module "bun:ffi" {
   enum FFIType {
@@ -20,9 +17,9 @@ declare module "bun:ffi" {
     /**
      * 8-bit signed integer
      *
-     * Must be a value between -127 and 127
+     * Must be a value between -128 and 127
      *
-     * When passing to a FFI function (C ABI), type coercion is not performed.
+     * When passing to an FFI function (C ABI), type coercion is not performed.
      *
      * In C:
      * ```c
@@ -39,9 +36,9 @@ declare module "bun:ffi" {
     /**
      * 8-bit signed integer
      *
-     * Must be a value between -127 and 127
+     * Must be a value between -128 and 127
      *
-     * When passing to a FFI function (C ABI), type coercion is not performed.
+     * When passing to an FFI function (C ABI), type coercion is not performed.
      *
      * In C:
      * ```c
@@ -61,7 +58,7 @@ declare module "bun:ffi" {
      *
      * Must be a value between 0 and 255
      *
-     * When passing to a FFI function (C ABI), type coercion is not performed.
+     * When passing to an FFI function (C ABI), type coercion is not performed.
      *
      * In C:
      * ```c
@@ -79,7 +76,7 @@ declare module "bun:ffi" {
      *
      * Must be a value between 0 and 255
      *
-     * When passing to a FFI function (C ABI), type coercion is not performed.
+     * When passing to an FFI function (C ABI), type coercion is not performed.
      *
      * In C:
      * ```c
@@ -98,11 +95,11 @@ declare module "bun:ffi" {
      *
      * Must be a value between -32768 and 32767
      *
-     * When passing to a FFI function (C ABI), type coercion is not performed.
+     * When passing to an FFI function (C ABI), type coercion is not performed.
      *
      * In C:
      * ```c
-     * in16_t
+     * int16_t
      * short // on arm64 & x64
      * ```
      *
@@ -117,11 +114,11 @@ declare module "bun:ffi" {
      *
      * Must be a value between -32768 and 32767
      *
-     * When passing to a FFI function (C ABI), type coercion is not performed.
+     * When passing to an FFI function (C ABI), type coercion is not performed.
      *
      * In C:
      * ```c
-     * in16_t
+     * int16_t
      * short // on arm64 & x64
      * ```
      *
@@ -137,7 +134,7 @@ declare module "bun:ffi" {
      *
      * Must be a value between 0 and 65535, inclusive.
      *
-     * When passing to a FFI function (C ABI), type coercion is not performed.
+     * When passing to an FFI function (C ABI), type coercion is not performed.
      *
      * In C:
      * ```c
@@ -156,7 +153,7 @@ declare module "bun:ffi" {
      *
      * Must be a value between 0 and 65535, inclusive.
      *
-     * When passing to a FFI function (C ABI), type coercion is not performed.
+     * When passing to an FFI function (C ABI), type coercion is not performed.
      *
      * In C:
      * ```c
@@ -216,45 +213,42 @@ declare module "bun:ffi" {
     u32 = 6,
 
     /**
-     * int64 is a 64-bit signed integer
-     *
-     * This is not implemented yet!
+     * 64-bit signed integer
      */
     int64_t = 7,
     /**
-     * i64 is a 64-bit signed integer
+     * 64-bit signed integer
      *
-     * This is not implemented yet!
+     * Alias of {@link FFIType.int64_t}
      */
     i64 = 7,
 
     /**
      * 64-bit unsigned integer
-     *
-     * This is not implemented yet!
      */
     uint64_t = 8,
     /**
      * 64-bit unsigned integer
-     *
-     * This is not implemented yet!
      */
     u64 = 8,
 
     /**
-     * Doubles are not supported yet!
+     * IEEE-754 double precision float
      */
     double = 9,
+
     /**
-     * Doubles are not supported yet!
+     * Alias of {@link FFIType.double}
      */
     f64 = 9,
+
     /**
-     * Floats are not supported yet!
+     * IEEE-754 single precision float
      */
     float = 10,
+
     /**
-     * Floats are not supported yet!
+     * Alias of {@link FFIType.float}
      */
     f32 = 10,
 
@@ -274,7 +268,7 @@ declare module "bun:ffi" {
     /**
      * Pointer value
      *
-     * See {@link Bun.FFI.ptr} for more information
+     * See the `ptr()` function for getting a pointer from a `TypedArray`
      *
      * In C:
      * ```c
@@ -290,7 +284,7 @@ declare module "bun:ffi" {
     /**
      * Pointer value
      *
-     * alias of {@link FFIType.ptr}
+     * Alias of {@link FFIType.ptr}
      */
     pointer = 12,
 
@@ -309,101 +303,101 @@ declare module "bun:ffi" {
     void = 13,
 
     /**
-     * When used as a `returns`, this will automatically become a {@link CString}.
+     * When used as a `returns`, the value becomes a `string` (a NULL pointer
+     * becomes `null`).
      *
-     * When used in `args` it is equivalent to {@link FFIType.pointer}
+     * When used in `args`, it is equivalent to {@link FFIType.pointer} and
+     * additionally accepts a JavaScript string.
      */
     cstring = 14,
 
     /**
-     * Attempt to coerce `BigInt` into a `Number` if it fits. This improves performance
-     * but means you might get a `BigInt` or you might get a `number`.
+     * Attempts to coerce a `BigInt` into a `number` when it fits. This improves
+     * performance, but the JavaScript value may be either a `number` or a
+     * `BigInt`, depending on the value.
      *
      * In C, this always becomes `int64_t`
-     *
-     * In JavaScript, this could be number or it could be BigInt, depending on what
-     * value is passed in.
      */
     i64_fast = 15,
 
     /**
-     * Attempt to coerce `BigInt` into a `Number` if it fits. This improves performance
-     * but means you might get a `BigInt` or you might get a `number`.
+     * Attempts to coerce a `BigInt` into a `number` when it fits. This improves
+     * performance, but the JavaScript value may be either a `number` or a
+     * `BigInt`, depending on the value.
      *
      * In C, this always becomes `uint64_t`
-     *
-     * In JavaScript, this could be number or it could be BigInt, depending on what
-     * value is passed in.
      */
     u64_fast = 16,
     function = 17,
+
+    napi_env = 18,
+    napi_value = 19,
+    buffer = 20,
+    /**
+     * A TypedArray or DataView whose **byte length** is passed to the callee as an
+     * unsigned 64-bit integer. Pass the *same* view you passed for a `buffer` parameter;
+     * the engine reads pointer and length off the same object at call time, so the two
+     * always agree (an atomic snapshot -- unlike passing `view.byteLength` yourself).
+     * Engine-native only; not supported inside `cc()`.
+     */
+    buffer_length = 21,
   }
 
   type Pointer = number & { __pointer__: null };
 
+  // Only the canonical enum members are listed below. `FFIType` declares
+  // several alias members (e.g. `i8` for `int8_t`, `pointer` for `ptr`) that
+  // share the same numeric value. Including both an enum member and its alias
+  // as computed property keys makes `tsgo` report duplicate identifiers, and
+  // the resulting lookup type is identical regardless of which alias is used
+  // since both resolve to the same numeric key.
   interface FFITypeToArgsType {
     [FFIType.char]: number;
     [FFIType.int8_t]: number;
-    [FFIType.i8]: number;
     [FFIType.uint8_t]: number;
-    [FFIType.u8]: number;
     [FFIType.int16_t]: number;
-    [FFIType.i16]: number;
     [FFIType.uint16_t]: number;
-    [FFIType.u16]: number;
     [FFIType.int32_t]: number;
-    [FFIType.i32]: number;
-    [FFIType.int]: number;
     [FFIType.uint32_t]: number;
-    [FFIType.u32]: number;
     [FFIType.int64_t]: number | bigint;
-    [FFIType.i64]: number | bigint;
     [FFIType.uint64_t]: number | bigint;
-    [FFIType.u64]: number | bigint;
     [FFIType.double]: number;
-    [FFIType.f64]: number;
     [FFIType.float]: number;
-    [FFIType.f32]: number;
     [FFIType.bool]: boolean;
-    [FFIType.ptr]: NodeJS.TypedArray | Pointer | CString | null;
-    [FFIType.pointer]: NodeJS.TypedArray | Pointer | CString | null;
+    [FFIType.ptr]: NodeJS.TypedArray | Pointer | bigint | null;
     [FFIType.void]: undefined;
-    [FFIType.cstring]: NodeJS.TypedArray | Pointer | CString | null;
+    [FFIType.cstring]: string | NodeJS.TypedArray | Pointer | bigint | null;
     [FFIType.i64_fast]: number | bigint;
     [FFIType.u64_fast]: number | bigint;
     [FFIType.function]: Pointer | JSCallback; // cannot be null
+    [FFIType.napi_env]: unknown;
+    [FFIType.napi_value]: unknown;
+    [FFIType.buffer]: NodeJS.TypedArray | DataView;
+    [FFIType.buffer_length]: NodeJS.TypedArray | DataView;
   }
   interface FFITypeToReturnsType {
     [FFIType.char]: number;
     [FFIType.int8_t]: number;
-    [FFIType.i8]: number;
     [FFIType.uint8_t]: number;
-    [FFIType.u8]: number;
     [FFIType.int16_t]: number;
-    [FFIType.i16]: number;
     [FFIType.uint16_t]: number;
-    [FFIType.u16]: number;
     [FFIType.int32_t]: number;
-    [FFIType.i32]: number;
-    [FFIType.int]: number;
     [FFIType.uint32_t]: number;
-    [FFIType.u32]: number;
     [FFIType.int64_t]: bigint;
-    [FFIType.i64]: bigint;
     [FFIType.uint64_t]: bigint;
-    [FFIType.u64]: bigint;
     [FFIType.double]: number;
-    [FFIType.f64]: number;
     [FFIType.float]: number;
-    [FFIType.f32]: number;
     [FFIType.bool]: boolean;
-    [FFIType.ptr]: Pointer | null;
-    [FFIType.pointer]: Pointer | null;
+    [FFIType.ptr]: Pointer | bigint | null;
     [FFIType.void]: undefined;
-    [FFIType.cstring]: CString;
+    [FFIType.cstring]: string | null;
     [FFIType.i64_fast]: number | bigint;
     [FFIType.u64_fast]: number | bigint;
-    [FFIType.function]: Pointer | null;
+    [FFIType.function]: Pointer | bigint | null;
+    [FFIType.napi_env]: unknown;
+    [FFIType.napi_value]: unknown;
+    [FFIType.buffer]: NodeJS.TypedArray | DataView;
+    [FFIType.buffer_length]: NodeJS.TypedArray | DataView;
   }
   interface FFITypeStringToType {
     ["char"]: FFIType.char;
@@ -436,13 +430,18 @@ declare module "bun:ffi" {
     ["function"]: FFIType.pointer; // for now
     ["usize"]: FFIType.uint64_t; // for now
     ["callback"]: FFIType.pointer; // for now
+    ["napi_env"]: FFIType.napi_env;
+    ["napi_value"]: FFIType.napi_value;
+    ["buffer"]: FFIType.buffer;
+    ["buffer_length"]: FFIType.buffer_length;
+    ["buffer_bytelength"]: FFIType.buffer_length;
   }
 
   type FFITypeOrString = FFIType | keyof FFITypeStringToType;
 
   interface FFIFunction {
     /**
-     * Arguments to a FFI function (C ABI)
+     * Arguments to an FFI function (C ABI)
      *
      * Defaults to an empty array, which means no arguments.
      *
@@ -471,7 +470,7 @@ declare module "bun:ffi" {
      */
     readonly args?: readonly FFITypeOrString[];
     /**
-     * Return type to a FFI function (C ABI)
+     * Return type of an FFI function (C ABI)
      *
      * Defaults to {@link FFIType.void}
      *
@@ -502,26 +501,25 @@ declare module "bun:ffi" {
     /**
      * Function pointer to the native function
      *
-     * If provided, instead of using dlsym() to lookup the function, Bun will use this instead.
-     * This pointer should not be null (0).
+     * If provided, Bun uses this pointer instead of looking the function up
+     * with `dlsym()`. It should not be null (0).
      *
-     * This is useful if the library has already been loaded
-     * or if the module is also using Node-API.
+     * Use this when the library is already loaded, or when the module is also
+     * using Node-API.
      */
     readonly ptr?: Pointer | bigint;
 
     /**
-     * Can C/FFI code call this function from a separate thread?
+     * Whether C/FFI code can call this function from a separate thread.
      *
      * Only supported with {@link JSCallback}.
      *
-     * This does not make the function run in a separate thread. It is still up to the application/library
-     * to run their code in a separate thread.
+     * This does not make the function run in a separate thread; the
+     * application or library is still responsible for its own threading.
      *
-     * By default, {@link JSCallback} calls are not thread-safe. Turning this on
-     * incurs a small performance penalty for every function call. That small
-     * performance penalty needs to be less than the performance gain from
-     * running the function in a separate thread.
+     * Enabling it adds a small cost to every call, so it's only worth it when
+     * that cost is smaller than what you gain from running the function on a
+     * separate thread.
      *
      * @default false
      */
@@ -529,14 +527,6 @@ declare module "bun:ffi" {
   }
 
   type Symbols = Readonly<Record<string, FFIFunction>>;
-
-  // /**
-  //  * Compile a callback function
-  //  *
-  //  * Returns a function pointer
-  //  *
-  //  */
-  // export function callback(ffi: FFIFunction, cb: Function): number;
 
   interface Library<Fns extends Symbols> {
     symbols: ConvertFns<Fns>;
@@ -546,30 +536,35 @@ declare module "bun:ffi" {
      *
      * Once called, the library is no longer usable.
      *
-     * Calling a function from a library that has been closed is undefined behavior.
+     * Calling a symbol from a closed {@link cc} library throws a `TypeError`.
+     * Calling a symbol from a closed {@link dlopen} or {@link linkSymbols} library is undefined behavior.
      */
     close(): void;
   }
 
   type ToFFIType<T extends FFITypeOrString> = T extends FFIType ? T : T extends string ? FFITypeStringToType[T] : never;
 
+  const FFIFunctionCallableSymbol: unique symbol;
   type ConvertFns<Fns extends Symbols> = {
-    [K in keyof Fns]: (
-      ...args: Fns[K]["args"] extends infer A extends readonly FFITypeOrString[]
-        ? { [L in keyof A]: FFITypeToArgsType[ToFFIType<A[L]>] }
-        : // eslint-disable-next-line @definitelytyped/no-single-element-tuple-type
-          [unknown] extends [Fns[K]["args"]]
-          ? []
-          : never
-    ) => [unknown] extends [Fns[K]["returns"]] // eslint-disable-next-line @definitelytyped/no-single-element-tuple-type
-      ? undefined
-      : FFITypeToReturnsType[ToFFIType<NonNullable<Fns[K]["returns"]>>];
+    [K in keyof Fns]: {
+      (
+        ...args: Fns[K]["args"] extends infer A extends readonly FFITypeOrString[]
+          ? { [L in keyof A]: FFITypeToArgsType[ToFFIType<A[L]>] }
+          : // eslint-disable-next-line @definitelytyped/no-single-element-tuple-type
+            [unknown] extends [Fns[K]["args"]]
+            ? []
+            : never
+      ): [unknown] extends [Fns[K]["returns"]] // eslint-disable-next-line @definitelytyped/no-single-element-tuple-type
+        ? undefined
+        : FFITypeToReturnsType[ToFFIType<NonNullable<Fns[K]["returns"]>>];
+      __ffi_function_callable: typeof FFIFunctionCallableSymbol;
+    };
   };
 
   /**
-   * Open a library using `"bun:ffi"`
+   * Open a native library and load symbols from it
    *
-   * @param name The name of the library or file path. This will be passed to `dlopen()`
+   * @param name Library name or file path, passed to `dlopen()`
    * @param symbols Map of symbols to load where the key is the symbol name and the value is the {@link FFIFunction}
    *
    * @example
@@ -587,15 +582,122 @@ declare module "bun:ffi" {
    * // "1.0.0"
    * ```
    *
-   * This is powered by just-in-time compiling C wrappers
-   * that convert JavaScript types to C types and back. Internally,
-   * bun uses [tinycc](https://github.com/TinyCC/tinycc), so a big thanks
-   * goes to Fabrice Bellard and TinyCC maintainers for making this possible.
+   * @category FFI
    */
   function dlopen<Fns extends Record<string, FFIFunction>>(
     name: string | import("bun").BunFile | URL,
     symbols: Fns,
   ): Library<Fns>;
+
+  /**
+   * **Experimental:** Compile ISO C11 source code using TinyCC, and make {@link symbols} available as functions to JavaScript.
+   *
+   * @param options Source file, symbols to expose, and compiler options
+   * @returns A library whose `symbols` are the compiled C functions
+   *
+   * @example
+   * ## Hello, World!
+   *
+   * JavaScript:
+   * ```js
+   * import { cc } from "bun:ffi";
+   * import source from "./hello.c" with {type: "file"};
+   * const {symbols: {hello}} = cc({
+   *   source,
+   *   symbols: {
+   *     hello: {
+   *       returns: "cstring",
+   *       args: [],
+   *     },
+   *   },
+   * });
+   * // "Hello, World!"
+   * console.log(hello());
+   * ```
+   *
+   * `./hello.c`:
+   * ```c
+   * #include <stdio.h>
+   * const char* hello() {
+   *   return "Hello, World!";
+   * }
+   * ```
+   */
+  function cc<Fns extends Record<string, FFIFunction>>(options: {
+    /**
+     * File path to an ISO C11 source file to compile and link
+     */
+    source: string | import("bun").BunFile | URL;
+
+    /**
+     * Library names to link against
+     *
+     * Equivalent to `-l` option in gcc/clang.
+     */
+    library?: string[] | string;
+
+    /**
+     * Include directories to pass to the compiler
+     *
+     * Equivalent to `-I` option in gcc/clang.
+     */
+    include?: string[] | string;
+
+    /**
+     * Map of symbols to load where the key is the symbol name and the value is the {@link FFIFunction}
+     */
+    symbols: Fns;
+
+    /**
+     * Map of symbols to define where the key is the symbol name and the value is the symbol value
+     *
+     * Equivalent to `-D` option in gcc/clang.
+     *
+     * @example
+     * ```js
+     * import { cc } from "bun:ffi";
+     * import source from "./hello.c" with {type: "file"};
+     * const {symbols: {hello}} = cc({
+     *   source,
+     *   define: {
+     *     "NDEBUG": "1",
+     *   },
+     *   symbols: {
+     *     hello: {
+     *       returns: "cstring",
+     *       args: [],
+     *     },
+     *   },
+     * });
+     * ```
+     */
+    define?: Record<string, string>;
+
+    /**
+     * Flags to pass to the compiler, for example to link against macOS
+     * frameworks. Bun makes no guarantees about which compiler version is
+     * used.
+     *
+     * @default "-std=c11 -Wl,--export-all-symbols -g -O2"
+     *
+     * @example
+     * ```js
+     * import { cc } from "bun:ffi";
+     * import source from "./hello.c" with {type: "file"};
+     * const {symbols: {hello}} = cc({
+     *   source,
+     *   flags: ["-framework CoreFoundation", "-framework Security"],
+     *   symbols: {
+     *     hello: {
+     *       returns: "cstring",
+     *       args: [],
+     *     },
+     *   },
+     * });
+     * ```
+     */
+    flags?: string | string[];
+  }): Library<Fns>;
 
   /**
    * Turn a native library's function pointer into a JavaScript function
@@ -618,12 +720,8 @@ declare module "bun:ffi" {
    * getVersion.close();
    * ```
    *
-   * This is powered by just-in-time compiling C wrappers
-   * that convert JavaScript types to C types and back. Internally,
-   * bun uses [tinycc](https://github.com/TinyCC/tinycc), so a big thanks
-   * goes to Fabrice Bellard and TinyCC maintainers for making this possible.
    */
-  function CFunction(fn: FFIFunction & { ptr: Pointer }): CallableFunction & {
+  function CFunction(fn: FFIFunction & { ptr: Pointer | number | bigint }): CallableFunction & {
     /**
      * Free the memory allocated by the wrapping function
      */
@@ -633,9 +731,9 @@ declare module "bun:ffi" {
   /**
    * Link a map of symbols to JavaScript functions
    *
-   * This lets you use native libraries that were already loaded somehow. You usually will want {@link dlopen} instead.
-   *
-   * You could use this with Node-API to skip loading a second time.
+   * Use this for native libraries that are already loaded, for example by
+   * Node-API, to skip loading them a second time. You usually want
+   * {@link dlopen} instead.
    *
    * @param symbols Map of symbols to load where the key is the symbol name and the value is the {@link FFIFunction}
    *
@@ -676,10 +774,6 @@ declare module "bun:ffi" {
    * ];
    * ```
    *
-   * This is powered by just-in-time compiling C wrappers
-   * that convert JavaScript types to C types and back. Internally,
-   * bun uses [tinycc](https://github.com/TinyCC/tinycc), so a big thanks
-   * goes to Fabrice Bellard and TinyCC maintainers for making this possible.
    */
   function linkSymbols<Fns extends Record<string, FFIFunction>>(symbols: Fns): Library<Fns>;
 
@@ -688,202 +782,215 @@ declare module "bun:ffi" {
    *
    * If `byteLength` is not provided, the pointer is assumed to be 0-terminated.
    *
+   * Bun catches some invalid pointers, but not all. Passing an invalid
+   * pointer, or reading past the end of the memory it points to, can crash
+   * the program or cause undefined behavior.
+   *
    * @param ptr The memory address to read
    * @param byteOffset bytes to skip before reading
    * @param byteLength bytes to read
-   *
-   * While there are some checks to catch invalid pointers, this is a difficult
-   * thing to do safely. Passing an invalid pointer can crash the program and
-   * reading beyond the bounds of the pointer will crash the program or cause
-   * undefined behavior. Use with care!
    */
-  function toBuffer(ptr: Pointer, byteOffset?: number, byteLength?: number): Buffer;
+  function toBuffer(ptr: Pointer | number | bigint, byteOffset?: number, byteLength?: number): Buffer;
 
   /**
    * Read a pointer as an {@link ArrayBuffer}
    *
    * If `byteLength` is not provided, the pointer is assumed to be 0-terminated.
    *
+   * Bun catches some invalid pointers, but not all. Passing an invalid
+   * pointer, or reading past the end of the memory it points to, can crash
+   * the program or cause undefined behavior.
+   *
    * @param ptr The memory address to read
    * @param byteOffset bytes to skip before reading
    * @param byteLength bytes to read
-   *
-   * While there are some checks to catch invalid pointers, this is a difficult
-   * thing to do safely. Passing an invalid pointer can crash the program and
-   * reading beyond the bounds of the pointer will crash the program or cause
-   * undefined behavior. Use with care!
    */
-  function toArrayBuffer(ptr: Pointer, byteOffset?: number, byteLength?: number): ArrayBuffer;
+  function toArrayBuffer(ptr: Pointer | number | bigint, byteOffset?: number, byteLength?: number): ArrayBuffer;
 
+  /**
+   * Read a value directly from a memory address, without creating a
+   * `DataView` or `ArrayBuffer`
+   */
   namespace read {
     /**
-     * The read function behaves similarly to DataView,
-     * but it's usually faster because it doesn't need to create a DataView or ArrayBuffer.
+     * Read an unsigned 8-bit integer at `ptr + byteOffset`
+     *
+     * Behaves like `DataView`, but is usually faster because it doesn't
+     * create a `DataView` or `ArrayBuffer`.
+     *
+     * Bun catches some invalid pointers, but not all. Passing an invalid
+     * pointer, or reading past the end of the memory it points to, can crash
+     * the program or cause undefined behavior.
      *
      * @param ptr The memory address to read
      * @param byteOffset bytes to skip before reading
-     *
-     * While there are some checks to catch invalid pointers, this is a difficult
-     * thing to do safely. Passing an invalid pointer can crash the program and
-     * reading beyond the bounds of the pointer will crash the program or cause
-     * undefined behavior. Use with care!
      */
-    function u8(ptr: Pointer, byteOffset?: number): number;
+    function u8(ptr: Pointer | number | bigint, byteOffset?: number): number;
     /**
-     * The read function behaves similarly to DataView,
-     * but it's usually faster because it doesn't need to create a DataView or ArrayBuffer.
+     * Read a signed 8-bit integer at `ptr + byteOffset`
+     *
+     * Behaves like `DataView`, but is usually faster because it doesn't
+     * create a `DataView` or `ArrayBuffer`.
+     *
+     * Bun catches some invalid pointers, but not all. Passing an invalid
+     * pointer, or reading past the end of the memory it points to, can crash
+     * the program or cause undefined behavior.
      *
      * @param ptr The memory address to read
      * @param byteOffset bytes to skip before reading
-     *
-     * While there are some checks to catch invalid pointers, this is a difficult
-     * thing to do safely. Passing an invalid pointer can crash the program and
-     * reading beyond the bounds of the pointer will crash the program or cause
-     * undefined behavior. Use with care!
      */
-    function i8(ptr: Pointer, byteOffset?: number): number;
+    function i8(ptr: Pointer | number | bigint, byteOffset?: number): number;
     /**
-     * The read function behaves similarly to DataView,
-     * but it's usually faster because it doesn't need to create a DataView or ArrayBuffer.
+     * Read an unsigned 16-bit integer at `ptr + byteOffset`
+     *
+     * Behaves like `DataView`, but is usually faster because it doesn't
+     * create a `DataView` or `ArrayBuffer`.
+     *
+     * Bun catches some invalid pointers, but not all. Passing an invalid
+     * pointer, or reading past the end of the memory it points to, can crash
+     * the program or cause undefined behavior.
      *
      * @param ptr The memory address to read
      * @param byteOffset bytes to skip before reading
-     *
-     * While there are some checks to catch invalid pointers, this is a difficult
-     * thing to do safely. Passing an invalid pointer can crash the program and
-     * reading beyond the bounds of the pointer will crash the program or cause
-     * undefined behavior. Use with care!
      */
-    function u16(ptr: Pointer, byteOffset?: number): number;
+    function u16(ptr: Pointer | number | bigint, byteOffset?: number): number;
     /**
-     * The read function behaves similarly to DataView,
-     * but it's usually faster because it doesn't need to create a DataView or ArrayBuffer.
+     * Read a signed 16-bit integer at `ptr + byteOffset`
+     *
+     * Behaves like `DataView`, but is usually faster because it doesn't
+     * create a `DataView` or `ArrayBuffer`.
+     *
+     * Bun catches some invalid pointers, but not all. Passing an invalid
+     * pointer, or reading past the end of the memory it points to, can crash
+     * the program or cause undefined behavior.
      *
      * @param ptr The memory address to read
      * @param byteOffset bytes to skip before reading
-     *
-     * While there are some checks to catch invalid pointers, this is a difficult
-     * thing to do safely. Passing an invalid pointer can crash the program and
-     * reading beyond the bounds of the pointer will crash the program or cause
-     * undefined behavior. Use with care!
      */
-    function i16(ptr: Pointer, byteOffset?: number): number;
+    function i16(ptr: Pointer | number | bigint, byteOffset?: number): number;
     /**
-     * The read function behaves similarly to DataView,
-     * but it's usually faster because it doesn't need to create a DataView or ArrayBuffer.
+     * Read an unsigned 32-bit integer at `ptr + byteOffset`
+     *
+     * Behaves like `DataView`, but is usually faster because it doesn't
+     * create a `DataView` or `ArrayBuffer`.
+     *
+     * Bun catches some invalid pointers, but not all. Passing an invalid
+     * pointer, or reading past the end of the memory it points to, can crash
+     * the program or cause undefined behavior.
      *
      * @param ptr The memory address to read
      * @param byteOffset bytes to skip before reading
-     *
-     * While there are some checks to catch invalid pointers, this is a difficult
-     * thing to do safely. Passing an invalid pointer can crash the program and
-     * reading beyond the bounds of the pointer will crash the program or cause
-     * undefined behavior. Use with care!
      */
-    function u32(ptr: Pointer, byteOffset?: number): number;
+    function u32(ptr: Pointer | number | bigint, byteOffset?: number): number;
     /**
-     * The read function behaves similarly to DataView,
-     * but it's usually faster because it doesn't need to create a DataView or ArrayBuffer.
+     * Read a signed 32-bit integer at `ptr + byteOffset`
+     *
+     * Behaves like `DataView`, but is usually faster because it doesn't
+     * create a `DataView` or `ArrayBuffer`.
+     *
+     * Bun catches some invalid pointers, but not all. Passing an invalid
+     * pointer, or reading past the end of the memory it points to, can crash
+     * the program or cause undefined behavior.
      *
      * @param ptr The memory address to read
      * @param byteOffset bytes to skip before reading
-     *
-     * While there are some checks to catch invalid pointers, this is a difficult
-     * thing to do safely. Passing an invalid pointer can crash the program and
-     * reading beyond the bounds of the pointer will crash the program or cause
-     * undefined behavior. Use with care!
      */
-    function i32(ptr: Pointer, byteOffset?: number): number;
+    function i32(ptr: Pointer | number | bigint, byteOffset?: number): number;
     /**
-     * The read function behaves similarly to DataView,
-     * but it's usually faster because it doesn't need to create a DataView or ArrayBuffer.
+     * Read a 32-bit float at `ptr + byteOffset`
+     *
+     * Behaves like `DataView`, but is usually faster because it doesn't
+     * create a `DataView` or `ArrayBuffer`.
+     *
+     * Bun catches some invalid pointers, but not all. Passing an invalid
+     * pointer, or reading past the end of the memory it points to, can crash
+     * the program or cause undefined behavior.
      *
      * @param ptr The memory address to read
      * @param byteOffset bytes to skip before reading
-     *
-     * While there are some checks to catch invalid pointers, this is a difficult
-     * thing to do safely. Passing an invalid pointer can crash the program and
-     * reading beyond the bounds of the pointer will crash the program or cause
-     * undefined behavior. Use with care!
      */
-    function f32(ptr: Pointer, byteOffset?: number): number;
+    function f32(ptr: Pointer | number | bigint, byteOffset?: number): number;
     /**
-     * The read function behaves similarly to DataView,
-     * but it's usually faster because it doesn't need to create a DataView or ArrayBuffer.
+     * Read an unsigned 64-bit integer at `ptr + byteOffset`, as a `bigint`
+     *
+     * Behaves like `DataView`, but is usually faster because it doesn't
+     * create a `DataView` or `ArrayBuffer`.
+     *
+     * Bun catches some invalid pointers, but not all. Passing an invalid
+     * pointer, or reading past the end of the memory it points to, can crash
+     * the program or cause undefined behavior.
      *
      * @param ptr The memory address to read
      * @param byteOffset bytes to skip before reading
-     *
-     * While there are some checks to catch invalid pointers, this is a difficult
-     * thing to do safely. Passing an invalid pointer can crash the program and
-     * reading beyond the bounds of the pointer will crash the program or cause
-     * undefined behavior. Use with care!
      */
-    function u64(ptr: Pointer, byteOffset?: number): bigint;
+    function u64(ptr: Pointer | number | bigint, byteOffset?: number): bigint;
     /**
-     * The read function behaves similarly to DataView,
-     * but it's usually faster because it doesn't need to create a DataView or ArrayBuffer.
+     * Read a signed 64-bit integer at `ptr + byteOffset`, as a `bigint`
+     *
+     * Behaves like `DataView`, but is usually faster because it doesn't
+     * create a `DataView` or `ArrayBuffer`.
+     *
+     * Bun catches some invalid pointers, but not all. Passing an invalid
+     * pointer, or reading past the end of the memory it points to, can crash
+     * the program or cause undefined behavior.
      *
      * @param ptr The memory address to read
      * @param byteOffset bytes to skip before reading
-     *
-     * While there are some checks to catch invalid pointers, this is a difficult
-     * thing to do safely. Passing an invalid pointer can crash the program and
-     * reading beyond the bounds of the pointer will crash the program or cause
-     * undefined behavior. Use with care!
      */
-    function i64(ptr: Pointer, byteOffset?: number): bigint;
+    function i64(ptr: Pointer | number | bigint, byteOffset?: number): bigint;
     /**
-     * The read function behaves similarly to DataView,
-     * but it's usually faster because it doesn't need to create a DataView or ArrayBuffer.
+     * Read a 64-bit double at `ptr + byteOffset`
+     *
+     * Behaves like `DataView`, but is usually faster because it doesn't
+     * create a `DataView` or `ArrayBuffer`.
+     *
+     * Bun catches some invalid pointers, but not all. Passing an invalid
+     * pointer, or reading past the end of the memory it points to, can crash
+     * the program or cause undefined behavior.
      *
      * @param ptr The memory address to read
      * @param byteOffset bytes to skip before reading
-     *
-     * While there are some checks to catch invalid pointers, this is a difficult
-     * thing to do safely. Passing an invalid pointer can crash the program and
-     * reading beyond the bounds of the pointer will crash the program or cause
-     * undefined behavior. Use with care!
      */
-    function f64(ptr: Pointer, byteOffset?: number): number;
+    function f64(ptr: Pointer | number | bigint, byteOffset?: number): number;
     /**
-     * The read function behaves similarly to DataView,
-     * but it's usually faster because it doesn't need to create a DataView or ArrayBuffer.
+     * Read a pointer at `ptr + byteOffset`
+     *
+     * Behaves like `DataView`, but is usually faster because it doesn't
+     * create a `DataView` or `ArrayBuffer`.
+     *
+     * Bun catches some invalid pointers, but not all. Passing an invalid
+     * pointer, or reading past the end of the memory it points to, can crash
+     * the program or cause undefined behavior.
      *
      * @param ptr The memory address to read
      * @param byteOffset bytes to skip before reading
-     *
-     * While there are some checks to catch invalid pointers, this is a difficult
-     * thing to do safely. Passing an invalid pointer can crash the program and
-     * reading beyond the bounds of the pointer will crash the program or cause
-     * undefined behavior. Use with care!
      */
-    function ptr(ptr: Pointer, byteOffset?: number): number;
+    function ptr(ptr: Pointer | number | bigint, byteOffset?: number): number;
     /**
-     * The read function behaves similarly to DataView,
-     * but it's usually faster because it doesn't need to create a DataView or ArrayBuffer.
+     * Read a pointer-sized signed integer (`intptr_t`) at `ptr + byteOffset`
+     *
+     * Behaves like `DataView`, but is usually faster because it doesn't
+     * create a `DataView` or `ArrayBuffer`.
+     *
+     * Bun catches some invalid pointers, but not all. Passing an invalid
+     * pointer, or reading past the end of the memory it points to, can crash
+     * the program or cause undefined behavior.
      *
      * @param ptr The memory address to read
      * @param byteOffset bytes to skip before reading
-     *
-     * While there are some checks to catch invalid pointers, this is a difficult
-     * thing to do safely. Passing an invalid pointer can crash the program and
-     * reading beyond the bounds of the pointer will crash the program or cause
-     * undefined behavior. Use with care!
      */
-    function intptr(ptr: Pointer, byteOffset?: number): number;
+    function intptr(ptr: Pointer | number | bigint, byteOffset?: number): number;
   }
 
   /**
    * Get the pointer backing a {@link TypedArray} or {@link ArrayBuffer}
    *
-   * Use this to pass {@link TypedArray} or {@link ArrayBuffer} to C functions.
+   * Use this to pass a {@link TypedArray} or {@link ArrayBuffer} to a C
+   * function. For performance reasons, FFI does not convert typed arrays to C
+   * pointers automatically.
    *
-   * This is for use with FFI functions. For performance reasons, FFI will
-   * not automatically convert typed arrays to C pointers.
-   *
-   * @param {TypedArray|ArrayBuffer|DataView} view the typed array or array buffer to get the pointer for
-   * @param {number} byteOffset optional offset into the view in bytes
+   * @param view The typed array, `ArrayBuffer`, or `DataView` to get the pointer of
+   * @param byteOffset Optional offset into the view, in bytes
    *
    * @example
    *
@@ -899,40 +1006,29 @@ declare module "bun:ffi" {
    *  // Do something with rawPtr
    * }
    * ```
+   *
+   * @category FFI
    */
   function ptr(view: NodeJS.TypedArray | ArrayBufferLike | DataView, byteOffset?: number): Pointer;
 
   /**
-   * Get a string from a UTF-8 encoded C string
-   * If `byteLength` is not provided, the string is assumed to be null-terminated.
+   * A JavaScript string decoded from a UTF-8 encoded C string.
    *
-   * @example
-   * ```js
-   * var ptr = lib.symbols.getVersion();
-   * console.log(new CString(ptr));
-   * ```
-   *
-   * @example
-   * ```js
-   * var ptr = lib.symbols.getVersion();
-   * // print the first 4 characters
-   * console.log(new CString(ptr, 0, 4));
-   * ```
-   *
-   * While there are some checks to catch invalid pointers, this is a difficult
-   * thing to do safely. Passing an invalid pointer can crash the program and
-   * reading beyond the bounds of the pointer will crash the program or cause
-   * undefined behavior. Use with care!
+   * @category FFI
    */
+  type CString = string;
 
-  class CString extends String {
+  interface CStringConstructor {
     /**
-     * Get a string from a UTF-8 encoded C string
-     * If `byteLength` is not provided, the string is assumed to be null-terminated.
+     * Read a UTF-8 encoded C string into a JavaScript string.
      *
-     * @param ptr The pointer to the C string
-     * @param byteOffset bytes to skip before reading
-     * @param byteLength bytes to read
+     * If `byteLength` is not provided, the string is assumed to be null-terminated.
+     * The result is a clone of the C string, so it is safe to keep using it after
+     * the memory at `ptr` has been freed. A falsy `ptr` yields an empty string.
+     *
+     * Bun catches some invalid pointers, but not all. Passing an invalid
+     * pointer, or reading past the end of the memory it points to, can crash
+     * the program or cause undefined behavior.
      *
      * @example
      * ```js
@@ -947,38 +1043,27 @@ declare module "bun:ffi" {
      * console.log(new CString(ptr, 0, 4));
      * ```
      *
-     * While there are some checks to catch invalid pointers, this is a difficult
-     * thing to do safely. Passing an invalid pointer can crash the program and
-     * reading beyond the bounds of the pointer will crash the program or cause
-     * undefined behavior. Use with care!
+     * @param ptr The pointer to the C string
+     * @param byteOffset bytes to skip before reading
+     * @param byteLength bytes to read
      */
-    constructor(ptr: Pointer, byteOffset?: number, byteLength?: number);
-
-    /**
-     * The ptr to the C string
-     *
-     * This `CString` instance is a clone of the string, so it
-     * is safe to continue using this instance after the `ptr` has been
-     * freed.
-     */
-    ptr: Pointer;
-    byteOffset?: number;
-    byteLength?: number;
-
-    /**
-     * Get the {@link ptr} as an `ArrayBuffer`
-     *
-     * `null` or empty ptrs returns an `ArrayBuffer` with `byteLength` 0
-     */
-    get arrayBuffer(): ArrayBuffer;
+    new (ptr: Pointer | number | bigint | null, byteOffset?: number, byteLength?: number): string;
+    (ptr: Pointer | number | bigint | null, byteOffset?: number, byteLength?: number): string;
   }
+
+  /**
+   * Get a string from a UTF-8 encoded C string.
+   *
+   * @category FFI
+   */
+  const CString: CStringConstructor;
 
   /**
    * Pass a JavaScript function to FFI (Foreign Function Interface)
    */
   class JSCallback {
     /**
-     * Enable a JavaScript callback function to be passed to C with bun:ffi
+     * Wrap a JavaScript function so it can be passed to C with `bun:ffi`
      *
      * @param callback The JavaScript function to be called
      * @param definition The C function definition
@@ -993,7 +1078,7 @@ declare module "bun:ffi" {
     readonly ptr: Pointer | null;
 
     /**
-     * Can the callback be called from a different thread?
+     * Whether the callback can be called from a different thread
      */
     readonly threadsafe: boolean;
 
@@ -1015,9 +1100,8 @@ declare module "bun:ffi" {
   function viewSource(callback: FFIFunction, is_callback: true): string;
 
   /**
-   * Platform-specific file extension name for dynamic libraries
-   *
-   * "." is not included
+   * Platform-specific file extension for dynamic libraries, without the
+   * leading "."
    *
    * @example
    * ```js

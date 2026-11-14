@@ -1,15 +1,15 @@
 // https://github.com/oven-sh/bun/issues/3216
-import { test, expect } from "bun:test";
-import { tmpdir } from "os";
-import { mkdtempSync, writeFileSync } from "fs";
+import { describe, expect, test } from "bun:test";
+import { writeFileSync } from "fs";
+import { bunEnv, bunExe, tmpdirSync } from "harness";
 import { join } from "path";
-import { bunEnv, bunExe } from "harness";
 
-test("runtime directory caching gets invalidated", () => {
-  const tmp = mkdtempSync(join(tmpdir(), "bun-test-"));
-  writeFileSync(
-    join(tmp, "index.ts"),
-    `const file = \`\${import.meta.dir}/temp.mjs\`;
+describe.concurrent("issue/03216", () => {
+  test("runtime directory caching gets invalidated", async () => {
+    const tmp = tmpdirSync();
+    writeFileSync(
+      join(tmp, "index.ts"),
+      `const file = \`\${import.meta.dir}/temp.mjs\`;
 const file2 = \`\${import.meta.dir}/second.mjs\`;
 
 import { existsSync, unlinkSync, writeFileSync } from "fs";
@@ -39,18 +39,23 @@ try {
   unlinkSync(file2);
 }
 `,
-  );
+    );
 
-  const result = Bun.spawnSync({
-    cmd: [bunExe(), "run", join(tmp, "index.ts")],
-    cwd: tmp,
-    env: bunEnv,
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "run", join(tmp, "index.ts")],
+      cwd: tmp,
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+
+    if (exitCode !== 0) {
+      console.log(stderr);
+    }
+
+    expect(stdout).toBe("1\n2\n");
+    expect(exitCode).toBe(0);
   });
-
-  if (result.exitCode !== 0) {
-    console.log(result.stderr.toString("utf-8"));
-  }
-
-  expect(result.exitCode).toBe(0);
-  expect(result.stdout.toString("utf-8")).toBe("1\n2\n");
 });

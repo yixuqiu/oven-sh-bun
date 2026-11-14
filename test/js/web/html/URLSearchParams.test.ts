@@ -1,4 +1,6 @@
-import { describe, it, expect } from "bun:test";
+import { setSyntheticAllocationLimitForTesting } from "bun:internal-for-testing";
+import { describe, expect, it } from "bun:test";
+import { bunEnv, bunExe } from "harness";
 
 describe("URLSearchParams", () => {
   it("does not crash when calling .toJSON() on a URLSearchParams object with a large number of properties", () => {
@@ -84,7 +86,6 @@ describe("URLSearchParams", () => {
       params.set(key, props[key as keyof typeof props]);
     }
 
-    // @ts-expect-error
     expect(params.toJSON()).toEqual(props);
 
     expect(Array.from(params.keys())).toHaveLength(params.size);
@@ -119,7 +120,7 @@ describe("URLSearchParams", () => {
       params.append("foo", "boop");
       params.append("bar", "baz");
       // @ts-ignore
-      expect(params.toJSON()).toEqual({
+      expect(params.toJSON() as Record<string, string | string[]>).toEqual({
         foo: ["bar", "boop"],
         bar: "baz",
       });
@@ -153,21 +154,210 @@ describe("URLSearchParams", () => {
 
       expect(JSON.stringify(params)).toBe("{}");
     });
+
+    it("should handle numeric string keys in .toJSON", () => {
+      const params = new URLSearchParams();
+      params.set("39208", "updated");
+      // @ts-ignore
+      expect(params.toJSON()).toEqual({ "39208": "updated" });
+    });
+
+    it("should handle various numeric keys in .toJSON", () => {
+      const params = new URLSearchParams();
+      params.set("0", "zero");
+      params.set("100", "hundred");
+      params.set("99999", "large");
+      // @ts-ignore
+      expect(params.toJSON()).toEqual({
+        "0": "zero",
+        "100": "hundred",
+        "99999": "large",
+      });
+    });
+
+    it("should handle mixed numeric and non-numeric keys in .toJSON", () => {
+      const params = new URLSearchParams();
+      params.set("name", "John");
+      params.set("123", "numeric");
+      params.set("age", "30");
+      params.set("456", "another");
+      // @ts-ignore
+      expect(params.toJSON()).toEqual({
+        "name": "John",
+        "123": "numeric",
+        "age": "30",
+        "456": "another",
+      });
+    });
+
+    it("should handle duplicate numeric keys in .toJSON", () => {
+      const params = new URLSearchParams();
+      params.append("100", "first");
+      params.append("100", "second");
+      params.append("name", "test");
+      // @ts-ignore
+      expect(params.toJSON() as Record<string, string | string[]>).toEqual({
+        "100": ["first", "second"],
+        "name": "test",
+      });
+    });
+
+    it("toJSON with extra arguments should not crash", () => {
+      const params = new URLSearchParams();
+      params.set("39208", "updated");
+      // toJSON should ignore extra arguments
+      // @ts-ignore - intentionally passing extra args
+      const result = params.toJSON({}, URLSearchParams, {}, "updated");
+      expect(result).toEqual({ "39208": "updated" });
+    });
   });
+});
+
+it("size property should be configurable (issue #9251)", () => {
+  const descriptor = Object.getOwnPropertyDescriptor(URLSearchParams.prototype, "size");
+  expect(descriptor).toBeDefined();
+  expect(descriptor!.configurable).toBe(true);
+  expect(descriptor!.enumerable).toBe(true);
 });
 
 it(".delete second argument", () => {
   const params = new URLSearchParams("a=1&a=2&b=3");
-  params.delete("a", 1);
+  params.delete("a", 1 as any);
   params.delete("b", undefined);
   expect(params + "").toBe("a=2");
 });
 
+describe("USVString conversion of lone surrogates", () => {
+  const loneHigh = "a\uD800b";
+  const loneLow = "a\uDC00b";
+  const replaced = "a\uFFFDb";
+
+  it("get/getAll/has find an entry appended under a lone surrogate name", () => {
+    const params = new URLSearchParams();
+    params.append(loneHigh, "1");
+    params.append(loneHigh, "2");
+
+    expect([...params]).toEqual([
+      [replaced, "1"],
+      [replaced, "2"],
+    ]);
+    expect(params.has(loneHigh)).toBe(true);
+    expect(params.get(loneHigh)).toBe("1");
+    expect(params.getAll(loneHigh)).toEqual(["1", "2"]);
+
+    // the converted spelling names the same entry
+    expect(params.has(replaced)).toBe(true);
+    expect(params.get(replaced)).toBe("1");
+    expect(params.getAll(replaced)).toEqual(["1", "2"]);
+  });
+
+  it("lone high and lone low surrogates both convert to U+FFFD", () => {
+    const params = new URLSearchParams();
+    params.append(loneLow, "low");
+    expect(params.get(loneLow)).toBe("low");
+    expect(params.get(loneHigh)).toBe("low");
+    expect(params.has(loneHigh)).toBe(true);
+  });
+
+  it("converts the value argument of .has()", () => {
+    const params = new URLSearchParams();
+    params.append("k", loneHigh);
+    expect(params.get("k")).toBe(replaced);
+    expect(params.has("k", loneHigh)).toBe(true);
+    expect(params.has("k", replaced)).toBe(true);
+  });
+
+  it(".set() and .delete() address the converted entry", () => {
+    const params = new URLSearchParams();
+    params.append(loneHigh, "1");
+    params.set(loneHigh, "2");
+    expect([...params]).toEqual([[replaced, "2"]]);
+    params.delete(loneHigh);
+    expect(params.size).toBe(0);
+  });
+
+  it("serializes and round-trips the converted name", () => {
+    const params = new URLSearchParams();
+    params.append(loneHigh, "1");
+    expect(params.toString()).toBe("a%EF%BF%BDb=1");
+    expect(new URLSearchParams(params.toString()).get(loneHigh)).toBe("1");
+
+    const url = new URL("https://example.com/");
+    url.searchParams.append(loneHigh, "1");
+    expect(url.search).toBe("?a%EF%BF%BDb=1");
+    expect(url.searchParams.get(loneHigh)).toBe("1");
+  });
+
+  it("leaves valid surrogate pairs alone", () => {
+    const params = new URLSearchParams();
+    params.append("\u{1F600}", "emoji");
+    expect(params.has("\u{1F600}")).toBe(true);
+    expect(params.get("\u{1F600}")).toBe("emoji");
+    expect(params.getAll("\u{1F600}")).toEqual(["emoji"]);
+    expect(params.get("\uFFFD")).toBeNull();
+    expect(params.toString()).toBe("%F0%9F%98%80=emoji");
+  });
+});
+
 it(".has second argument", () => {
   const params = new URLSearchParams("a=1&a=2&b=3");
-  expect(params.has("a", 1)).toBe(true);
-  expect(params.has("a", 2)).toBe(true);
-  expect(params.has("a", 3)).toBe(false);
-  expect(params.has("b", 3)).toBe(true);
-  expect(params.has("b", 4)).toBe(false);
+  expect(params.has("a", 1 as any)).toBe(true);
+  expect(params.has("a", 2 as any)).toBe(true);
+  expect(params.has("a", 3 as any)).toBe(false);
+  expect(params.has("b", 3 as any)).toBe(true);
+  expect(params.has("b", 4 as any)).toBe(false);
+});
+
+it("throws for a name or value that is too long to decode", () => {
+  const long = Buffer.alloc(600_000, "é").toString();
+  const ascii = Buffer.alloc(600_000, "a").toString();
+  const url = new URL("http://x/?a=1");
+  const params = url.searchParams;
+  // With a 1 MiB limit the decoder is capped at 524288 UTF-8 bytes.
+  const originalLimit = setSyntheticAllocationLimitForTesting(1024 * 1024);
+  try {
+    expect(() => new URLSearchParams(long)).toThrow("Out of memory");
+    expect(() => new URLSearchParams("a=1&b=" + long)).toThrow("Out of memory");
+    expect(() => new URL("http://x/?" + long).searchParams).toThrow("Out of memory");
+    expect(() => {
+      url.href = "http://x/?" + long;
+    }).toThrow("Out of memory");
+    expect(params.size).toBe(0);
+    // ASCII without escapes doesn't need decoding.
+    expect(new URLSearchParams(ascii).size).toBe(1);
+  } finally {
+    setSyntheticAllocationLimitForTesting(originalLimit);
+  }
+});
+
+it("throws when the pair list can't grow", async () => {
+  await using proc = Bun.spawn({
+    cmd: [
+      bunExe(),
+      "-e",
+      `
+        // With a 64 KiB limit the list is capped at 4096 pairs.
+        const full = Buffer.alloc(8192, "a&").toString();
+        const params = new URLSearchParams(full);
+        for (const grow of [() => params.append("a", ""), () => params.set("b", ""), () => new URLSearchParams(full + "a")]) {
+          try {
+            grow();
+            console.log("no error");
+          } catch (e) {
+            console.log(e.name, e.message);
+          }
+        }
+        console.log(params.size);
+      `,
+    ],
+    env: { ...bunEnv, BUN_FEATURE_FLAG_SYNTHETIC_MEMORY_LIMIT: String(64 * 1024) },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+  expect({ stdout, stderr, exitCode }).toEqual({
+    stdout: "RangeError Out of memory\n".repeat(3) + "4096\n",
+    stderr: "",
+    exitCode: 0,
+  });
 });

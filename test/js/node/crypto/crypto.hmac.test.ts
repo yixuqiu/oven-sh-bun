@@ -1,5 +1,6 @@
+import { describe, expect, test } from "bun:test";
 import { Hmac, createHmac, createSecretKey } from "crypto";
-import { test, expect, describe } from "bun:test";
+import { PassThrough } from "stream";
 
 function testHmac(algo, key, data, expected) {
   if (!Array.isArray(data)) data = [data];
@@ -19,14 +20,41 @@ function testHmac(algo, key, data, expected) {
 }
 
 describe("crypto.Hmac", () => {
-  test.todo("Hmac is expected to return a new instance", async () => {
-    const instance = Hmac("sha256", "Node");
+  test("Hmac is expected to return a new instance", async () => {
+    const instance = (Hmac as any)("sha256", "Node");
     expect(instance instanceof Hmac).toBe(true);
   });
 
+  test("_flush should not set finalized", async () => {
+    const s = new PassThrough();
+    const h = createHmac("sha1", "hi");
+
+    const { resolve, promise } = Promise.withResolvers();
+
+    s.pipe(h)
+      .on("data", c => {
+        expect(c).toBe("f2a1c2327e7bf3297b3f494716666a30cf1ddf3f");
+
+        // _flush should not set finalized, but
+        // buffer shoule be empty because m_ctx.reset()
+        // was called
+        expect(h.digest("hex")).toBe("");
+        resolve();
+      })
+      .setEncoding("hex");
+
+    s.end("hi");
+
+    await promise;
+  });
+
   test("createHmac should throw when using invalid options", async () => {
-    expect(() => createHmac(null)).toThrow("null is not an object");
-    expect(() => createHmac("sha1", null)).toThrow("null is not an object");
+    // @ts-expect-error
+    expect(() => createHmac(null)).toThrow('The "hmac" argument must be of type string. Received null');
+    // @ts-expect-error
+    expect(() => createHmac("sha1", null)).toThrow(
+      'The "key" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, DataView, KeyObject, or CryptoKey. Received null',
+    );
   });
 
   describe("test HMAC with multiple updates.", async () => {
@@ -392,8 +420,8 @@ describe("crypto.Hmac", () => {
       }
       {
         const h = createHmac("sha1", "key").update("data");
-        expect(h.digest("buffer")).toEqual(Buffer.from(expected, "latin1"));
-        expect(h.digest("buffer")).toEqual(Buffer.from(""));
+        expect((h as any).digest("buffer")).toEqual(Buffer.from(expected, "latin1"));
+        expect((h as any).digest("buffer")).toEqual(Buffer.from(""));
       }
     }
     {
@@ -407,13 +435,13 @@ describe("crypto.Hmac", () => {
       }
       {
         const h = createHmac("sha1", "key");
-        expect(h.digest("buffer")).toEqual(Buffer.from(expected, "latin1"));
-        expect(h.digest("buffer")).toEqual(Buffer.from(""));
+        expect((h as any).digest("buffer")).toEqual(Buffer.from(expected, "latin1"));
+        expect((h as any).digest("buffer")).toEqual(Buffer.from(""));
       }
     }
   });
   test("Invalid digest", async () => {
-    expect(() => createHmac("sha7", "key")).toThrow(/sha7 is not supported/);
+    expect(() => createHmac("sha7", "key")).toThrow("Invalid digest: sha7");
   });
 
   test("secret digest", async () => {

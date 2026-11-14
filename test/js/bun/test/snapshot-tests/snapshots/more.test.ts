@@ -1,7 +1,7 @@
-import { it, test, expect, describe } from "bun:test";
+import { describe, expect, test } from "bun:test";
 
 describe("d0", () => {
-  test.todo("snapshot serialize edgecases", () => {
+  test("snapshot serialize edgecases", () => {
     expect(1).toMatchSnapshot();
     expect("1\b2\n3\r4").toMatchSnapshot();
     expect("\r\n").toMatchSnapshot();
@@ -20,6 +20,10 @@ describe("d0", () => {
     apshot`).toMatchSnapshot();
     expect(new String()).toMatchSnapshot();
     expect(new String("")).toMatchSnapshot();
+    expect(new String("日本")).toMatchSnapshot("String with 16-bit storage");
+    expect(new String(new TextDecoder("utf-16le").decode(new Uint16Array([0x61, 0x62])))).toMatchSnapshot(
+      "String with ASCII text in 16-bit storage",
+    );
 
     expect({ a: { b: 1 } }).toEqual({ a: { b: 1 } });
     expect("\\\nexport with test name\n\n").toMatchSnapshot();
@@ -47,7 +51,7 @@ describe("d0", () => {
 
 describe("d0", () => {
   describe("d1", () => {
-    test.todo("t1", () => {
+    test("t1", () => {
       expect("hello`snapshot\\").toEqual("hello`snapshot\\");
       expect("hello`snapshot\\").toMatchSnapshot();
     });
@@ -58,7 +62,7 @@ describe("d0", () => {
   test("t3", () => {
     expect("hello snapshot").toMatchSnapshot();
   });
-  test.todo("t4", () => {
+  test("t4", () => {
     expect("hello`snapshot\\").toMatchSnapshot();
   });
 });

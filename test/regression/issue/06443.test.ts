@@ -1,5 +1,5 @@
-import { describe, test, expect } from "bun:test";
-import { serve, file } from "bun";
+import { file, serve } from "bun";
+import { describe, expect, test } from "bun:test";
 
 describe("Bun.serve()", () => {
   const tls = {
@@ -31,7 +31,7 @@ describe("Bun.serve()", () => {
       const proto = options.tls ? "https" : "http";
       const target = `${proto}://localhost:${server.port}/`;
       const response = await fetch(target, { tls: { rejectUnauthorized: false } });
-      expect(response.text()).resolves.toMatch(url);
+      await expect(response.text()).resolves.toMatch(url);
     } finally {
       server.stop(true);
     }

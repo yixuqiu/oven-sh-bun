@@ -1,7 +1,7 @@
-import path from "path";
+import crypto from "crypto";
 import fs from "fs";
 import os from "os";
-import crypto from "crypto";
+import path from "path";
 import { debug } from "./console";
 
 export function join(...paths: (string | string[])[]): string {
@@ -42,7 +42,7 @@ export function rm(path: string): void {
     return;
   }
   try {
-    fs.rmdirSync(path, { recursive: true });
+    (fs.rmdirSync as typeof fs.rmSync)(path, { recursive: true });
     return;
   } catch (error) {
     debug("fs.rmdirSync failed", error);
@@ -76,7 +76,7 @@ export function rename(path: string, newPath: string): void {
 export function write(dst: string, content: string | ArrayBuffer | ArrayBufferView): void {
   debug("write", dst);
   try {
-    fs.writeFileSync(dst, content);
+    fs.writeFileSync(dst, content as string | NodeJS.ArrayBufferView);
     return;
   } catch (error) {
     debug("fs.writeFileSync failed", error);
@@ -88,7 +88,7 @@ export function write(dst: string, content: string | ArrayBuffer | ArrayBufferVi
       debug("fs.mkdirSync failed", error);
       // The directory could have been created already.
     }
-    fs.writeFileSync(dst, content);
+    fs.writeFileSync(dst, content as string | NodeJS.ArrayBufferView);
   }
 }
 
@@ -124,7 +124,7 @@ export function blob(path: string): Blob {
   });
 }
 
-export function hash(content: string | crypto.BinaryLike): string {
+export function hash(content: string | NodeJS.ArrayBufferView): string {
   debug("hash", content);
   return crypto
     .createHash("sha256")
@@ -156,4 +156,16 @@ export function exists(path: string): boolean {
     debug("fs.existsSync failed", error);
   }
   return false;
+}
+
+export function link(path: string, newPath: string): void {
+  debug("link", path, newPath);
+  try {
+    fs.unlinkSync(newPath);
+    fs.linkSync(path, newPath);
+    return;
+  } catch (error) {
+    copy(path, newPath);
+    debug("fs.linkSync failed, reverting to copy", error);
+  }
 }

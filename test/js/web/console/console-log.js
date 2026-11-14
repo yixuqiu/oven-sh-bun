@@ -14,6 +14,10 @@ console.log(Infinity);
 console.log(-Infinity);
 console.log(Symbol("Symbol Description"));
 console.log(new Date(Math.pow(2, 34) * 56));
+console.log(new String("Hello"));
+console.log(new String("Hello 👋🏼"));
+console.log(new Number(5));
+console.log(new Boolean(true));
 console.log([123, 456, 789]);
 console.log({ name: "foo" });
 console.log({ a: 123, b: 456, c: 789 });
@@ -201,6 +205,8 @@ console.log({ "": "" });
   console.log(proxy.proxy);
 }
 
+console.log([[[[Array(1000).fill(4)]]]]);
+
 {
   // proxy custom inspect
   const proxy = new Proxy(
@@ -255,3 +261,12 @@ console.log("%f", 0.30000000000000004);
 
 console.log("Hello %cWorld", "color: red", 123);
 console.log("Hello %vWorld", 123);
+
+console.log("Hello %i %i", [1, 2, 3, 4]);
+console.log("Hello %i %", [1, 2, 3, 4], 1);
+console.log("Hello %i %j", [1, 2, 3, 4], 1);
+console.log("Hello \\%i %i,", 5, 6);
+console.log("Hello %%i %i", 5, 6);
+
+// doesn't go out of bounds when printing
+console.log("%%d", 1);

@@ -22,10 +22,15 @@
 /* The loop is lazily created per-thread and run with run() */
 
 #include "LoopData.h"
+#include <cerrno>
 #include <libusockets.h>
-#include <iostream>
+#include "AsyncSocket.h"
 
 extern "C" int bun_is_exiting();
+extern "C" void __attribute__((__noreturn__)) Bun__panic(const char *message, size_t length);
+#ifndef _WIN32
+extern "C" void __attribute__((__noreturn__)) Bun__loopInitFailed(int err);
+#endif
 
 namespace uWS {
 struct Loop {
@@ -52,6 +57,18 @@ private:
         for (auto &p : loopData->preHandlers) {
             p.second((Loop *) loop);
         }
+
+        /* Drain any leftover corks. Two slots max. */
+        for (int i = 0; i < 2; i++) {
+            bool ssl;
+            void *corkedSocket = loopData->getAnyCorkedSocket(&ssl);
+            if (!corkedSocket) break;
+            if (ssl) {
+                ((uWS::AsyncSocket<true> *) corkedSocket)->uncork();
+            } else {
+                ((uWS::AsyncSocket<false> *) corkedSocket)->uncork();
+            }
+        }
     }
 
     static void postCb(us_loop_t *loop) {
@@ -71,21 +88,19 @@ private:
     }
 
     static Loop *create(void *hint) {
-        Loop *loop = ((Loop *) us_create_loop(hint, wakeupCb, preCb, postCb, sizeof(LoopData)))->init();
-
-        /* We also need some timers (should live off the one 4 second timer rather) */
-        LoopData *loopData = (LoopData *) us_loop_ext((struct us_loop_t *) loop);
-        loopData->dateTimer = us_create_timer((struct us_loop_t *) loop, 1, sizeof(LoopData *));
-        loopData->updateDate();
-        
-        memcpy(us_timer_ext(loopData->dateTimer), &loopData, sizeof(LoopData *));
-        us_timer_set(loopData->dateTimer, [](struct us_timer_t *t) {
-            LoopData *loopData;
-            memcpy(&loopData, us_timer_ext(t), sizeof(LoopData *));
-            loopData->updateDate();
-        }, 1000, 1000);
-
-        return loop;
+        Loop *loop = (Loop *) us_create_loop(hint, wakeupCb, preCb, postCb, sizeof(LoopData));
+        if (!loop) {
+            /* The per-thread loop is not recoverable; every caller of get()
+             * dereferences it. Only Bun.spawnSync's isolated loop (created
+             * through the Rust uws::Loop::create) surfaces this as an error. */
+#ifndef _WIN32
+            Bun__loopInitFailed(errno);
+#else
+            static const char msg[] = "failed to create the event loop";
+            Bun__panic(msg, sizeof(msg) - 1);
+#endif
+        }
+        return loop->init();
     }
 
     /* What to do with loops created with existingNativeLoop? */
@@ -93,15 +108,16 @@ private:
         ~LoopCleaner() {
             // There's no need to call this destructor if Bun is in the process of exiting.
             // This is both a performance thing, and also to prevent freeing some things which are not meant to be freed
-            // such as uv_tty_t 
+            // such as uv_tty_t
             if(loop && cleanMe && !bun_is_exiting()) {
+                cleanMe = false;
                 loop->free();
             }
         }
         Loop *loop = nullptr;
         bool cleanMe = false;
     };
-    
+
     static LoopCleaner &getLazyLoop() {
         static thread_local LoopCleaner lazyLoop;
         return lazyLoop;
@@ -126,19 +142,34 @@ public:
         return getLazyLoop().loop;
     }
 
+    /* A thread that ran a loop is exiting: free this thread's loop whether uSockets created the
+     * native loop (cleanMe) or was handed one (Windows: the thread's libuv loop, which the caller
+     * closes afterwards; us_loop_free leaves a borrowed native loop alone). */
+    static void freeLoopAtThreadExit() {
+        if (getLazyLoop().loop) {
+            getLazyLoop().loop->free();
+        }
+    }
+
     /* Freeing the default loop should be done once */
     void free() {
         LoopData *loopData = (LoopData *) us_loop_ext((us_loop_t *) this);
-
-        /* Stop and free dateTimer first */
-        us_timer_close(loopData->dateTimer, 1);
-
+        
         loopData->~LoopData();
         /* uSockets will track whether this loop is owned by us or a borrowed alien loop */
         us_loop_free((us_loop_t *) this);
 
         /* Reset lazyLoop */
         getLazyLoop().loop = nullptr;
+    }
+
+    static LoopData* data(struct us_loop_t *loop) {
+        return (LoopData *) us_loop_ext(loop);
+    }
+
+    /* Runs the pre handlers and drains leftover corks. For callers that won't tick the loop again. */
+    void flushPendingWrites() {
+        preCb((us_loop_t *) this);
     }
 
     void addPostHandler(void *key, MoveOnlyFunction<void(Loop *)> &&handler) {
@@ -184,16 +215,6 @@ public:
         us_loop_run((us_loop_t *) this);
     }
 
-    /* Passively integrate with the underlying default loop */
-    /* Used to seamlessly integrate with third parties such as Node.js */
-    void integrate() {
-        us_loop_integrate((us_loop_t *) this);
-    }
-
-    /* Dynamically change this */
-    void setSilent(bool silent) {
-        ((LoopData *) us_loop_ext((us_loop_t *) this))->noMark = silent;
-    }
 };
 
 /* Can be called from any thread to run the thread local loop */

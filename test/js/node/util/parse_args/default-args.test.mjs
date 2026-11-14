@@ -1,7 +1,7 @@
 import { spawn } from "bun";
-import { afterAll, beforeAll, expect, test, describe } from "bun:test";
-import { bunExe, bunEnv } from "harness";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import fs from "fs/promises";
+import { bunEnv, bunExe } from "harness";
 import os from "os";
 import path from "path";
 
@@ -50,7 +50,7 @@ describe("parseArgs default args", () => {
     const exitCode = await subprocess.exited;
     exited = true;
     clearTimeout(timer);
-    const stdout = await new Response(subprocess.stdout).text();
+    const stdout = await subprocess.stdout.text();
     expect(exitCode).toBe(0);
     return { stdout };
   }
@@ -76,5 +76,15 @@ describe("parseArgs default args", () => {
     if (execArgv) {
       expect(output?.execArgv).toEqual(execArgv);
     }
+  });
+
+  test.each([
+    ["--eval=<code>", code => [`--eval=${code}`]],
+    ["-pe <code>", code => ["-pe", code]],
+    ["a script that shortens process.argv", code => ["-e", `process.argv.length = 0; ${code}`]],
+  ])("returns no positionals when process.argv has no program arguments: %s", async (_, args) => {
+    const code = `console.log(JSON.stringify(require("node:util").parseArgs({ strict: false }).positionals))`;
+    const { stdout } = await spawnBun(...args(code));
+    expect(stdout.split("\n")[0]).toBe("[]");
   });
 });

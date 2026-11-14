@@ -1,31 +1,54 @@
+const rss = process.memoryUsage.rss;
+
+async function memoryUsage() {
+  Bun.gc(true);
+  await Bun.sleep(50);
+  return rss();
+}
+
+const http2 = process.argv.includes("--http2");
 const server = Bun.serve({
   port: 0,
+  idleTimeout: 0,
+  ...(http2 ? { tls: require("harness").tls, http2: true } : {}),
   async fetch(req: Request) {
-    if (req.url.endsWith("/report")) {
+    const url = req.url;
+    if (url.endsWith("/report")) {
+      return new Response(JSON.stringify(await memoryUsage()), {
+        headers: {
+          "Content-Type": "application/json",
+        },
+      });
+    } else if (url.endsWith("/heap-snapshot")) {
       Bun.gc(true);
       await Bun.sleep(10);
-      return new Response(JSON.stringify(process.memoryUsage.rss()), {
+      require("v8").writeHeapSnapshot("/tmp/heap.heapsnapshot");
+      console.log("Wrote heap snapshot to /tmp/heap.heapsnapshot");
+      return new Response(JSON.stringify(await memoryUsage()), {
         headers: {
           "Content-Type": "application/json",
         },
       });
     }
-    if (req.url.endsWith("/buffering")) {
+    if (url.endsWith("/json-buffering")) {
+      await req.json();
+    } else if (url.endsWith("/buffering")) {
       await req.text();
-    } else if (req.url.endsWith("/streaming")) {
-      const reader = req.body?.getReader();
+    } else if (url.endsWith("/buffering+body-getter")) {
+      req.body;
+      await req.text();
+    } else if (url.endsWith("/streaming")) {
+      const reader = req.body!.getReader();
       while (reader) {
         const { done, value } = await reader?.read();
         if (done) {
           break;
         }
       }
-    } else if (req.url.endsWith("/incomplete-streaming")) {
+    } else if (url.endsWith("/incomplete-streaming")) {
       const reader = req.body?.getReader();
-      if (!reader) {
-        reader?.read();
-      }
-    } else if (req.url.endsWith("/streaming-echo")) {
+      await reader?.read();
+    } else if (url.endsWith("/streaming-echo")) {
       return new Response(req.body, {
         headers: {
           "Content-Type": "application/octet-stream",
@@ -36,3 +59,17 @@ const server = Bun.serve({
   },
 });
 console.log(server.url.href);
+process?.send?.(server.url.href);
+
+if (!process.send) {
+  setInterval(() => {
+    Bun.gc(true);
+    const rssMB = (rss() / 1024 / 1024) | 0;
+    console.log("RSS", rssMB, "MB");
+    console.log("Active requests", server.pendingRequests);
+
+    if (rssMB > 1024) {
+      require("v8").writeHeapSnapshot("/tmp/heap.heapsnapshot");
+    }
+  }, 5000);
+}

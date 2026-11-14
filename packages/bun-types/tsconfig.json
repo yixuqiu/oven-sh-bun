@@ -1,16 +1,13 @@
 {
+  "extends": "../../tsconfig.base.json",
   "compilerOptions": {
-    "lib": ["ESNext"],
-    "skipLibCheck": false,
-    "strict": true,
-    "target": "esnext",
-    "module": "esnext",
-    "moduleResolution": "node",
-    "allowSyntheticDefaultImports": true,
-    "disableSolutionSearching": true,
-    "noUnusedLocals": true,
-    "noEmit": true,
-    "resolveJsonModule": true
+    "skipLibCheck": true,
+    "declaration": true,
+    "emitDeclarationOnly": true,
+    "noEmit": false,
+    "declarationDir": "out"
   },
-  "exclude": ["dist", "node_modules"]
+  "include": ["**/*.ts"],
+  // ts7.1/ uses syntax that the repository's TypeScript cannot parse yet.
+  "exclude": ["dist", "node_modules", "ts7.1"]
 }

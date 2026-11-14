@@ -1,4 +1,4 @@
-import { it, test, expect, describe } from "bun:test";
+import { describe, expect, it, test } from "bun:test";
 
 test("it will create a snapshot file if it doesn't exist", () => {
   expect({ a: { b: { c: false } }, c: 2, jkfje: 99238 }).toMatchSnapshot({ a: { b: { c: expect.any(Boolean) } } });
@@ -12,6 +12,25 @@ test("it will create a snapshot file if it doesn't exist", () => {
     a: "any",
     b: expect.any(String),
   });
+});
+
+test("ArrayBuffer values are serialized like typed arrays", () => {
+  expect(new Uint8Array([1, 2, 3]).buffer).toMatchInlineSnapshot(`
+    ArrayBuffer [
+      1,
+      2,
+      3,
+    ]
+  `);
+  expect({ a: 1, b: new Uint8Array([4, 5]).buffer }).toMatchInlineSnapshot(`
+    {
+      "a": 1,
+      "b": ArrayBuffer [
+        4,
+        5,
+      ],
+    }
+  `);
 });
 
 describe("toMatchSnapshot errors", () => {

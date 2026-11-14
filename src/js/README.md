@@ -1,11 +1,12 @@
 # JS Modules
 
-**TLDR**: If anything here changes, re-run `make js`. If you add/remove files, `make regenerate-bindings`.
+**TLDR**: If anything here changes, re-run `bun run build`.
 
 - `./node` contains all `node:*` modules
 - `./bun` contains all `bun:*` modules
 - `./thirdparty` contains npm modules we replace like `ws`
 - `./internal` contains modules that aren't assigned to the module resolver
+- `./ahead-of-time` contains second texts of some of the modules above, under the same names. `bun run` evaluates the first text of a module. `bun build --compile --aot` compiles the second one where there is one. The two must do the same: a change to one of them goes into the other too. That includes which built-in functions a text calls while it loads, with what and in which order: a test that has replaced one sees every call. A call that only the second text makes goes to the function under its private name (`Object.$defineProperty`). `bun src/codegen/check-types-of-modules.ts` checks the types as the compiler reads them
 
 Each `.ts`/`.js` file above is assigned a numeric id at compile time and inlined into an array of lazily initialized modules. Internal modules referencing each other is extremely optimized, skipping the module resolver entirely.
 
@@ -36,7 +37,7 @@ V8 has a [similar feature](https://v8.dev/blog/embedded-builtins) to this syntax
 
 On top of this, we have some special functions that are handled by the builtin preprocessor:
 
-- `require` works, but it must be passed a **string literal** that resolves to a module within `src/js`. This call gets replaced with `$getInternalField($internalModuleRegistery, <number>)`, which directly loads the module by its generated numerical ID, skipping the resolver for inter-internal modules.
+- `require` works, but it must be passed a **string literal** that resolves to a module within `src/js`. This call gets replaced with `$getInternalField($internalModuleRegistry, <number>)`, which directly loads the module by its generated numerical ID, skipping the resolver for inter-internal modules.
 
 - `$debug()` is exactly like console.log, but is stripped in release builds. It is disabled by default, requiring you to pass one of: `BUN_DEBUG_MODULE_NAME=1`, `BUN_DEBUG_JS=1`, or `BUN_DEBUG_ALL=1`. You can also do `if($debug) {}` to check if debug env var is set.
 
@@ -46,20 +47,30 @@ On top of this, we have some special functions that are handled by the builtin p
 
 - `process.platform` and `process.arch` is properly inlined and DCE'd. Do use this to run different code on different platforms.
 
+- `"unlikely";` as the first statement of an arm of an `if` (`if (error) { "unlikely"; ... }`, or the same in an `else { ... }`) is an expression statement that does nothing, so it is nothing in `bun run`. `bun build --compile --aot` reads it in these files only: the arm is compiled out of the way of the usual path. It never changes what the code does. Use it where you know that the arm is unusual: errors, replaced built-ins, every way out of a fast path. A wrong one costs two jumps and slower code each time the arm runs. Anywhere else in a file it is read by nobody, and `bun lint` reports it (`bun/no-unused-expressions`).
+
+- `("frames are native code");` and `("has no frames");` as the first statement of a function of a module are expression statements that do nothing, and the bundler drops them, so they are nothing in `bun run`. `bun build --compile --aot` reads them in these files only. They are for a function that `bun run` has inside a function of `builtins/`, where its frames read `at name (native:1:2)`, and that an executable has in a module, because there it reads the module's variables. The first gives its frames in an executable that form, and the functions written inside it too. The second is for a part of such a function that stands in a function of its own: no stack trace lists it. Keep the parentheses: without them the string is a directive, which the bundler keeps. A third, `("frames are of bun:wrap");`, stands in `src/aot/prelude/decorators.ts` alone: `bun run` has the functions that apply decorators in `bun:wrap`, programs look for its frames above a decorator, and so the frames of the compiler's own functions for it name that module.
+
+- `/* part of: internal/name.ts */` on a line of its own says that the module holds a part of another module, for code that an executable runs and that must not load all of the other one. A stack trace shows its functions under the name of the other module. A change to one of the two goes into the other too.
+
 ## Builtin Modules
 
-In module files, instead of using `module.exports`, use the `export default` variable. Due to the internal implementation, these must be `JSCell` types (function / object).
+Files in `node`, `bun`, `thirdparty`, and `internal` are all bundled as "modules". These go through the preprocessor to construct a JS function, where `export default`/`export function`/etc are converted into a `return` statement. Due to this, non-type `import` statements are not supported.
+
+By using `export default`, this controls the result of using `require` to import the module. When ESM imports this module (userland), all properties on this object are available as named exports. Named exports are preprocessed into properties on this default object.
 
 ```ts
+const fs = require("fs"); // load another builtin module
+
 export default {
   hello: 2,
   world: 3,
 };
 ```
 
-Keep in mind that **these are not ES modules**. `export default` is only syntax sugar to assign to the variable `$exports`, which is actually how the module exports its contents. `export var` and `export function` are banned syntax, and so is `import` (use `require` instead)
+Keep in mind that **these are not ES modules**. `export default` is only syntax sugar to assign to the variable `$exports`, which is actually how the module exports its contents.
 
-To actually wire up one of these modules to the resolver, that is done separately in `module_resolver.zig`. Maybe in the future we can do codegen for it.
+To actually wire up one of these modules to the resolver, that is done separately in `src/resolve_builtins/`. Maybe in the future we can do codegen for it.
 
 ## Builtin Functions
 
@@ -72,18 +83,18 @@ object->putDirectBuiltinFunction(
   vm,
   globalObject,
   identifier,
-  // ReadableStream.ts, `function readableStreamToJSON()`
+  // Fifo.ts, `function createFIFO()`
   // This returns a FunctionExecutable* (extends JSCell*, but not JSFunction*).
-  readableStreamReadableStreamToJSONCodeGenerator(vm),
+  fifoCreateFIFOCodeGenerator(vm),
   JSC::PropertyAttribute::DontDelete | 0
 );
 ```
 
 ## Building
 
-Run `make js` to bundle all the builtins. The output is placed in `src/js/out/{modules,functions}/`, where these files are loaded dynamically by `bun-debug` (an exact filepath is inlined into the binary pointing at where you cloned bun, so moving the binary to another machine may not work). In a release build, these get minified and inlined into the binary (Please commit those generated headers).
+Run `bun run build` to bundle all the builtins. The output is placed in `build/debug/js`, where these files are loaded dynamically by `bun-debug` (an exact filepath is inlined into the binary pointing at where you cloned bun, so moving the binary to another machine may not work). In a release build, these get minified and inlined into the binary (Please commit those generated headers).
 
-If you change the list of files or functions, you will have to run `make regenerate-bindings`, but otherwise any change can be done with just `make js`.
+If you change the list of files or functions, you will have to run `bun run build`.
 
 ## Notes on how the build process works
 
@@ -93,7 +104,7 @@ The build process is built on top of Bun's bundler. The first step is scanning a
 
 The `$` for private names is actually a lie, and in JSC it actually uses `@`; though that is a syntax error in regular JS/TS, so we opted for better IDE support. So first we have to pre-process the files to spot all instances of `$` at the start of an identifier and we convert it to `__intrinsic__`. We also scan for `require(string)` and replace it with `$requireId(n)` after resolving it to the integer id, which is defined in `./functions/Module.ts`. `export default` is transformed into `return ...;`, however this transform is a little more complicated that a string replace because it supports that not being the final statement, and access to the underlying variable `$exports`, etc.
 
-The preprocessor is smart enough to not replace `$` in strings, comments, regex, etc. However, it is not a real JS parser and instead a recursive regex-based nightmare, so may hit some edge cases. Yell at Dave if it breaks.
+The preprocessor is smart enough to not replace `$` in strings, comments, regex, etc. However, it is not a real JS parser and instead a recursive regex-based nightmare, so may hit some edge cases. Yell at Chloe if it breaks.
 
 The module is then printed like:
 

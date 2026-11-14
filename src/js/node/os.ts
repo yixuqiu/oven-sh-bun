@@ -1,7 +1,49 @@
 // Hardcoded module "node:os"
+interface CpuInfo {
+  model: string;
+  speed: number;
+  times: { user: number; nice: number; sys: number; idle: number; irq: number };
+}
 
-var tmpdir = function () {
-  var env = Bun.env;
+interface NetworkInterfaceInfo {
+  address: string;
+  netmask: string;
+  family: "IPv4" | "IPv6";
+  mac: string;
+  internal: boolean;
+  cidr: string | null;
+  scopeid?: number;
+}
+
+interface UserInfo {
+  uid: number;
+  gid: number;
+  username: string | Buffer;
+  homedir: string | Buffer;
+  shell: string | Buffer | null;
+}
+
+// src/runtime/node/node_os.bind.ts
+interface Binding {
+  hostCpuCount: number;
+  cpus(): CpuInfo[];
+  freemem(): number;
+  getPriority(pid?: number): number;
+  homedir(): string;
+  hostname(): string;
+  loadavg(): number[];
+  networkInterfaces(): Record<string, NetworkInterfaceInfo[]>;
+  release(): string;
+  totalmem(): number;
+  uptime(): number;
+  userInfo(options?: { encoding?: string } | null): UserInfo;
+  version(): string;
+  setPriority(pid: number, priority: number): void;
+  setPriority(priority: number): void;
+}
+
+var tmpdir = function (): string {
+  var env: Record<string, string | undefined> = Bun.env;
 
   tmpdir = function () {
     if (process.platform === "win32") {
@@ -13,11 +55,14 @@ var tmpdir = function () {
       }
       return path;
     }
-    var path = env["TMPDIR"] || env["TMP"] || env["TEMP"] || "/tmp";
+    var path =
+      env["TMPDIR"] || env["TMP"] || env["TEMP"] || (process.platform === "android" ? "/data/local/tmp" : "/tmp");
     const length = path.length;
     if (length > 1 && path[length - 1] === "/") path = path.slice(0, -1);
     return path;
   };
+
+  tmpdir[Symbol.toPrimitive] = tmpdir;
 
   return tmpdir();
 };
@@ -27,9 +72,9 @@ var tmpdir = function () {
 // Some packages like FastGlob only bother to read the length of the array
 // so instead of actually populating the entire object
 // we turn them into getters
-function lazyCpus({ cpus }) {
+function lazyCpus({ cpus, hostCpuCount }: Binding) {
   return () => {
-    const array = new Array(navigator.hardwareConcurrency);
+    const array: CpuInfo[] = new Array(hostCpuCount);
     function populate() {
       const results = cpus();
       const length = results.length;
@@ -85,44 +130,104 @@ function lazyCpus({ cpus }) {
 }
 
 // all logic based on `process.platform` and `process.arch` is inlined at bundle time
-function bound(obj) {
+function bound(binding: Binding) {
   return {
-    availableParallelism: () => navigator.hardwareConcurrency,
-    arch: () => process.arch,
-    cpus: lazyCpus(obj),
-    endianness: () => (process.arch === "arm64" || process.arch === "x64" ? "LE" : $bundleError("TODO: endianness")),
-    freemem: obj.freemem.bind(obj),
-    getPriority: obj.getPriority.bind(obj),
-    homedir: obj.homedir.bind(obj),
-    hostname: obj.hostname.bind(obj),
-    loadavg: obj.loadavg.bind(obj),
-    networkInterfaces: obj.networkInterfaces.bind(obj),
-    platform: () => process.platform,
-    release: obj.release.bind(obj),
-    setPriority: obj.setPriority.bind(obj),
+    availableParallelism: function () {
+      return navigator.hardwareConcurrency;
+    },
+    arch: function () {
+      return process.arch;
+    },
+    cpus: lazyCpus(binding),
+    endianness: function () {
+      return process.arch === "arm64" || process.arch === "x64" //
+        ? "LE"
+        : $bundleError("TODO: endianness");
+    },
+    freemem: binding.freemem,
+    // Plain functions where Node's are, so that `new os.homedir()` does what it does there. The other four are not constructors in Node either.
+    getPriority: function (pid?: number) {
+      return binding.getPriority(pid);
+    },
+    homedir: function () {
+      return binding.homedir();
+    },
+    hostname: function () {
+      return binding.hostname();
+    },
+    loadavg: function () {
+      return binding.loadavg();
+    },
+    networkInterfaces: function () {
+      return binding.networkInterfaces();
+    },
+    platform: function () {
+      return process.platform;
+    },
+    release: binding.release,
+    setPriority: function (pid: number, priority?: number) {
+      return binding.setPriority(pid, priority!);
+    },
     get tmpdir() {
       return tmpdir;
     },
-    totalmem: obj.totalmem.bind(obj),
-    type: () =>
-      process.platform === "win32"
+    totalmem: binding.totalmem,
+    type: function () {
+      return process.platform === "win32"
         ? "Windows_NT"
         : process.platform === "darwin"
           ? "Darwin"
-          : process.platform === "linux"
+          : process.platform === "linux" || process.platform === "android"
             ? "Linux"
-            : $bundleError("TODO: type"),
-    uptime: obj.uptime.bind(obj),
-    userInfo: obj.userInfo.bind(obj),
-    version: obj.version.bind(obj),
-    machine: obj.machine.bind(obj),
+            : process.platform === "freebsd"
+              ? "FreeBSD"
+              : $bundleError("TODO: type");
+    },
+    uptime: function () {
+      return binding.uptime();
+    },
+    userInfo: function (options?: { encoding?: string } | null) {
+      return binding.userInfo(options);
+    },
+    version: binding.version,
+    machine: function () {
+      // TODO: linux arm64 should also return "aarch64" (Node/uname compat) —
+      // separate PR to avoid behavior change in the Android port.
+      // FreeBSD: uname -m returns MACHINE ("arm64"/"amd64"), not MACHINE_ARCH.
+      return process.arch === "arm64"
+        ? process.platform === "android"
+          ? "aarch64"
+          : "arm64"
+        : process.arch === "x64"
+          ? process.platform === "freebsd"
+            ? "amd64"
+            : "x86_64"
+          : $bundleError("TODO: machine");
+    },
     devNull: process.platform === "win32" ? "\\\\.\\nul" : "/dev/null",
-    EOL: process.platform === "win32" ? "\r\n" : "\n",
+    get EOL() {
+      return process.platform === "win32" ? "\r\n" : "\n";
+    },
     constants: $processBindingConstants.os,
   };
 }
 
-const out = bound($zig("node_os.zig", "OS.create"));
+const out = bound({
+  hostCpuCount: $bindgen("node_os.bind.ts", "hostCpuCount") as number,
+  cpus: $bindgen("node_os.bind.ts", "cpus"),
+  freemem: $bindgen("node_os.bind.ts", "freemem"),
+  getPriority: $bindgen("node_os.bind.ts", "getPriority"),
+  homedir: $bindgen("node_os.bind.ts", "homedir"),
+  hostname: $bindgen("node_os.bind.ts", "hostname"),
+  loadavg: $bindgen("node_os.bind.ts", "loadavg"),
+  networkInterfaces: $bindgen("node_os.bind.ts", "networkInterfaces"),
+  release: $bindgen("node_os.bind.ts", "release"),
+  totalmem: $bindgen("node_os.bind.ts", "totalmem"),
+  uptime: $bindgen("node_os.bind.ts", "uptime"),
+  userInfo: $bindgen("node_os.bind.ts", "userInfo"),
+  version: $bindgen("node_os.bind.ts", "version"),
+  setPriority: $bindgen("node_os.bind.ts", "setPriority"),
+});
 
 symbolToStringify(out, "arch");
 symbolToStringify(out, "availableParallelism");
@@ -138,8 +243,10 @@ symbolToStringify(out, "type");
 symbolToStringify(out, "uptime");
 symbolToStringify(out, "version");
 symbolToStringify(out, "machine");
-function symbolToStringify(obj, key) {
-  obj[key][Symbol.toPrimitive] = function (hint) {
+
+function symbolToStringify<Key extends string>(obj: Record<Key, () => unknown>, key: Key) {
+  $assert(obj[key] !== undefined, `Missing ${key}`);
+  obj[key][Symbol.toPrimitive] = function (_hint: string) {
     return obj[key]();
   };
 }

@@ -1,15 +1,25 @@
 import { spawnSync } from "bun";
-import { describe, expect, it } from "bun:test";
-import { bunEnv, bunExe, ospath } from "harness";
+import { isModuleResolveFilenameSlowPathEnabled } from "bun:internal-for-testing";
+import { expect, it, mock } from "bun:test";
+import { bunEnv, bunExe, expectRssDeltaBelow, ospath, tempDir } from "harness";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
-import * as Module from "node:module";
+import Module from "node:module";
+import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
 import sync from "./require-json.json";
-import { tmpdir } from "node:os";
 
 const { path, dir, dirname, filename } = import.meta;
 
 const tmpbase = tmpdir() + sep;
+
+it("import.meta.require is settable", () => {
+  const old = import.meta.require;
+  const fn = mock(() => "hello");
+  import.meta.require = fn;
+  expect(import.meta.require("hello")).toBe("hello");
+  import.meta.require = old;
+  expect(fn).toHaveBeenCalledTimes(1);
+});
 
 it("import.meta.main", () => {
   const { exitCode } = spawnSync({
@@ -18,6 +28,57 @@ it("import.meta.main", () => {
     stderr: "inherit",
     stdout: "inherit",
     stdin: null,
+  });
+  expect(exitCode).toBe(0);
+});
+
+it("import.meta.main follows a Bun.main override but not an own path property, is readable from a vm context, and is false in workers", async () => {
+  using dir = tempDir("import-meta-main", {
+    "entry.mjs": `
+      import { runInNewContext } from "node:vm";
+      import { Worker, isMainThread, parentPort } from "node:worker_threads";
+      if (isMainThread) {
+        const worker = new Worker(new URL(import.meta.url));
+        const fromWorker = new Promise((resolve, reject) => {
+          worker.once("message", resolve);
+          worker.once("error", reject);
+        });
+        const other = await import("./other.mjs");
+        const entryPath = import.meta.path;
+        const before = [import.meta.main, other.main()];
+        const vmContext = [import.meta, other.meta].map(meta => runInNewContext("meta.main", { meta }));
+        Bun.main = other.path;
+        const after = [import.meta.main, other.main()];
+        // main is computed from the module's own path, so swapping the visible path properties changes nothing.
+        Object.defineProperty(import.meta, "path", { value: other.path });
+        Object.defineProperty(other.meta, "path", { value: entryPath });
+        const ownPath = [import.meta.main, other.main()];
+        console.log(JSON.stringify({ before, vmContext, after, ownPath, worker: await fromWorker }));
+        await worker.terminate();
+      } else {
+        parentPort.postMessage(import.meta.main);
+      }
+    `,
+    "other.mjs": `
+      export const meta = import.meta;
+      export const path = import.meta.path;
+      export const main = () => import.meta.main;
+    `,
+  });
+  await using proc = Bun.spawn({
+    cmd: [bunExe(), "entry.mjs"],
+    cwd: String(dir),
+    env: bunEnv,
+    stdout: "pipe",
+    stderr: "inherit",
+  });
+  const [stdout, exitCode] = await Promise.all([proc.stdout.text(), proc.exited]);
+  expect(JSON.parse(stdout)).toEqual({
+    before: [true, false],
+    vmContext: [true, false],
+    after: [false, true],
+    ownPath: [false, true],
+    worker: false,
   });
   expect(exitCode).toBe(0);
 });
@@ -62,8 +123,8 @@ it("Module.createRequire does not use file url as the referrer (err message chec
   } catch (e) {
     expect(e.name).not.toBe("UnreachableError");
     expect(e.message).not.toInclude("file:///");
-    expect(e.message).toInclude('"whaaat"');
-    expect(e.message).toInclude('"' + import.meta.path + '"');
+    expect(e.message).toInclude(`'whaaat'`);
+    expect(e.message).toInclude(import.meta.path);
   }
 });
 
@@ -127,7 +188,12 @@ it("Module._cache", () => {
 });
 
 it("Module._resolveFilename()", () => {
-  expect(Module._resolveFilename).toBeUndefined();
+  expect(isModuleResolveFilenameSlowPathEnabled()).toBe(false);
+  const original = Module._resolveFilename;
+  Module._resolveFilename = () => {};
+  expect(isModuleResolveFilenameSlowPathEnabled()).toBe(true);
+  Module._resolveFilename = original;
+  expect(isModuleResolveFilenameSlowPathEnabled()).toBe(false);
 });
 
 it("Module.createRequire(file://url).resolve(file://url)", () => {
@@ -190,7 +256,7 @@ it("import.meta.require (javascript, live bindings)", () => {
 });
 
 it("import.meta.dir", () => {
-  expect(dir).toEndWith(ospath("/bun/test/js/bun/resolve"));
+  expect(dir).toEndWith(ospath("/test/js/bun/resolve"));
 });
 
 it("import.meta.dirname", () => {
@@ -202,7 +268,7 @@ it("import.meta.filename", () => {
 });
 
 it("import.meta.path", () => {
-  expect(path).toEndWith(ospath("/bun/test/js/bun/resolve/import-meta.test.js"));
+  expect(path).toEndWith(ospath("/test/js/bun/resolve/import-meta.test.js"));
 });
 
 it('require("bun") works', () => {
@@ -233,6 +299,15 @@ it("require.resolve error code", () => {
 it("import non exist error code", async () => {
   try {
     await import("node:missing");
+    throw 1;
+  } catch (e) {
+    expect(e.code).toBe("ERR_UNKNOWN_BUILTIN_MODULE");
+  }
+});
+
+it("import non exist error code", async () => {
+  try {
+    await import("./idontexist");
     throw 1;
   } catch (e) {
     expect(e.code).toBe("ERR_MODULE_NOT_FOUND");
@@ -271,3 +346,11 @@ it("import.meta is correct in a module that was required with a query param", as
   expect(cjs.dir).toBe(import.meta.dir);
   expect(cjs.file).toBe("other-cjs.js");
 });
+
+it("import.meta of a collected module does not leak its url", async () => {
+  // 200 module records with a 512 KB url each: 100 MiB when every one leaks.
+  await expectRssDeltaBelow(["--smol", join(import.meta.dir, "import-meta-url-leak-fixture.mjs"), "200"], {
+    release: 40,
+    debug: 55,
+  });
+}, 90_000);

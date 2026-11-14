@@ -12,9 +12,11 @@
   "search.exclude": {
     "node_modules": true,
     ".git": true,
-    "src/bun.js/WebKit": true,
-    "src/deps/*/**": true,
+    "vendor/*/**": true,
     "test/node.js/upstream": true,
+    // This will fill up your whole search history.
+    "test/js/node/test/fixtures": true,
+    "test/js/node/test/common": true,
   },
   "search.followSymlinks": false,
   "search.useIgnoreFiles": true,
@@ -24,33 +26,26 @@
   "git.ignoreSubmodules": true,
   "git.ignoreLimitWarning": true,
 
-  // Zig
-  "zig.initialSetupDone": true,
-  "zig.buildOnSave": false,
-  "zig.buildOption": "build",
-  "zig.buildFilePath": "${workspaceFolder}/build.zig",
-  "zig.path": "${workspaceFolder}/.cache/zig/zig.exe",
-  "zig.formattingProvider": "zls",
-  "zig.zls.enableInlayHints": false,
-  "[zig]": {
-    "editor.tabSize": 4,
-    "editor.useTabStops": false,
-    "editor.defaultFormatter": "ziglang.vscode-zig",
-  },
+  // lldb
+  "lldb.launch.initCommands": ["command source ${workspaceFolder}/.lldbinit"],
+  "lldb.verboseLogging": false,
 
   // C++
-  "lldb.verboseLogging": false,
   "cmake.configureOnOpen": false,
   "C_Cpp.errorSquiggles": "enabled",
   "[cpp]": {
+    "editor.tabSize": 4,
     "editor.defaultFormatter": "xaver.clang-format",
   },
   "[c]": {
+    "editor.tabSize": 4,
     "editor.defaultFormatter": "xaver.clang-format",
   },
   "[h]": {
+    "editor.tabSize": 4,
     "editor.defaultFormatter": "xaver.clang-format",
   },
+  "clangd.arguments": ["--header-insertion=never"],
 
   // JavaScript
   "prettier.enable": true,
@@ -62,9 +57,10 @@
   "[javascriptreact]": {
     "editor.defaultFormatter": "esbenp.prettier-vscode",
   },
+  "prettier.prettierPath": "./node_modules/prettier",
 
   // TypeScript
-  "typescript.tsdk": "${workspaceFolder}/node_modules/typescript/lib",
+  "typescript.tsdk": "node_modules/typescript/lib",
   "[typescript]": {
     "editor.defaultFormatter": "esbenp.prettier-vscode",
   },
@@ -121,12 +117,15 @@
     "**/*.xcscheme": true,
     "**/*.xcodeproj": true,
     "**/*.i": true,
-
-    // uws WebSocket.cpp conflicts with webcore WebSocket.cpp
-    "packages/bun-uws/fuzzing": true,
   },
   "files.associations": {
+    "*.css": "tailwindcss",
     "*.idl": "cpp",
+    "*.mdc": "markdown",
+    "array": "cpp",
+    "ios": "cpp",
+    "oxlint.json": "jsonc",
+    "bun.lock": "jsonc",
   },
   "C_Cpp.files.exclude": {
     "**/.vscode": true,
@@ -146,4 +145,6 @@
     "WebKit/WebKitBuild": true,
     "WebKit/WebInspectorUI": true,
   },
+  "git.detectSubmodules": false,
+  "bun.test.customScript": "./build/debug/bun-debug test",
 }

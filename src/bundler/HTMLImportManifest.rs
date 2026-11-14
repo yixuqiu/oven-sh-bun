@@ -1,0 +1,377 @@
+//! HTMLImportManifest generates JSON manifests for HTML imports in Bun's bundler.
+//!
+//! When you import an HTML file in JavaScript:
+//! ```javascript
+//! import index from "./index.html";
+//! console.log(index);
+//! ```
+//!
+//! Bun transforms this into a call to `__jsonParse()` with a JSON manifest containing
+//! metadata about all the files generated from the HTML import:
+//!
+//! ```javascript
+//! var src_default = __jsonParse(
+//!   '{"index":"./index.html","files":[{"input":"index.html","path":"./index-f2me3qnf.js","loader":"js","isEntry":true,"headers":{"etag": "eet6gn75","content-type": "text/javascript;charset=utf-8"}},{"input":"index.html","path":"./index.html","loader":"html","isEntry":true,"headers":{"etag": "r9njjakd","content-type": "text/html;charset=utf-8"}},{"input":"index.html","path":"./index-gysa5fmk.css","loader":"css","isEntry":true,"headers":{"etag": "50zb7x61","content-type": "text/css;charset=utf-8"}},{"input":"logo.svg","path":"./logo-kygw735p.svg","loader":"file","isEntry":false,"headers":{"etag": "kygw735p","content-type": "application/octet-stream"}},{"input":"react.svg","path":"./react-ck11dneg.svg","loader":"file","isEntry":false,"headers":{"etag": "ck11dneg","content-type": "application/octet-stream"}}]}'
+//! );
+//! ```
+//!
+//! The manifest JSON structure contains:
+//! - `index`: The original HTML file path
+//! - `files`: Array of all generated files with metadata:
+//!   - `input`: Original source file path
+//!   - `path`: Generated output file path (with content hash)
+//!   - `loader`: File type/loader used (js, css, html, file, etc.)
+//!   - `isEntry`: Whether this file is an entry point
+//!   - `headers`: HTTP headers including ETag and Content-Type
+//!
+//! This enables applications to:
+//! 1. Know all files generated from an HTML import
+//! 2. Get proper MIME types and ETags for serving files
+//! 3. Implement proper caching strategies
+//! 4. Handle assets referenced by the HTML file
+//!
+//! The manifest is generated during the linking phase and serialized as a JSON string
+//! that gets embedded directly into the JavaScript output.
+
+use crate::mal_prelude::*;
+
+use bun_ast::Source;
+use bun_collections::AutoBitSet;
+use bun_collections::VecExt;
+use bun_core::strings;
+use bun_io::Write;
+use bun_js_printer::Encoding;
+use bun_paths::resolve_path::{platform, platform_to_posix_in_place, relative_normalized};
+use bun_resolver::fs::FileSystem;
+
+use crate::Graph::Graph;
+use crate::chunk::Content;
+use crate::options::{Loader, OutputFile, OutputKind};
+use crate::options_impl::LoaderExt as _;
+use crate::{BundleV2, Chunk, LinkerGraph};
+
+fn write_entry_item<W: Write + ?Sized>(
+    writer: &mut W,
+    input: &[u8],
+    path: &[u8],
+    hash: u64,
+    loader: Loader,
+    kind: OutputKind,
+) -> Result<(), crate::Error> {
+    writer.write_all(b"{")?;
+
+    if !input.is_empty() {
+        writer.write_all(b"\"input\":")?;
+        bun_js_printer::write_json_string::<_, { Encoding::Utf8 }>(input, writer)?;
+        writer.write_all(b",")?;
+    }
+
+    writer.write_all(b"\"path\":")?;
+    bun_js_printer::write_json_string::<_, { Encoding::Utf8 }>(path, writer)?;
+
+    writer.write_all(b",\"loader\":\"")?;
+    // strum is configured snake_case, so this prints the lowercase tag name.
+    writer.write_all(<&'static str>::from(loader).as_bytes())?;
+    writer.write_all(b"\",\"isEntry\":")?;
+    writer.write_all(if kind == OutputKind::EntryPoint {
+        b"true" as &[u8]
+    } else {
+        b"false"
+    })?;
+    writer.write_all(b",\"headers\":{")?;
+
+    if hash > 0 {
+        const BASE64_BUF_LEN: usize =
+            bun_base64::encode_len_from_size(core::mem::size_of::<u64>()) + 2;
+        let mut base64_buf = [0u8; BASE64_BUF_LEN];
+        let n = bun_base64::encode_url_safe(&mut base64_buf, &hash.to_ne_bytes());
+        let base64 = &base64_buf[..n];
+        writer.write_all(b"\"etag\":\"")?;
+        writer.write_all(base64)?;
+        writer.write_all(b"\",")?;
+    }
+
+    // Valid mime types are valid headers, which do not need to be escaped in JSON.
+    let mime = loader.to_mime_type(&[path]);
+    writer.write_all(b"\"content-type\":\"")?;
+    writer.write_all(&mime.value)?;
+    writer.write_all(b"\"")?;
+
+    writer.write_all(b"}}")?;
+    Ok(())
+}
+
+// Extremely unfortunate, but necessary due to E.String not accepting pre-escaped input and this happening at the very end.
+pub(crate) fn write_escaped_json<W: Write + ?Sized>(
+    index: u32,
+    graph: &Graph,
+    linker_graph: &LinkerGraph<'_>,
+    chunks: &[Chunk],
+    writer: &mut W,
+) -> Result<(), crate::Error> {
+    let mut bytes: Vec<u8> = Vec::new();
+    write(index, graph, linker_graph, chunks, &mut bytes)?;
+    bun_js_printer::write_pre_quoted_string::<_, b'"', false, true, { Encoding::Utf8 }>(
+        &bytes, writer,
+    )?;
+    Ok(())
+}
+
+pub(crate) fn write<W: Write + ?Sized>(
+    index: u32,
+    graph: &Graph,
+    linker_graph: &LinkerGraph<'_>,
+    chunks: &[Chunk],
+    writer: &mut W,
+) -> Result<(), crate::Error> {
+    write_with_assets(
+        index,
+        graph,
+        linker_graph,
+        chunks,
+        &graph.additional_output_files,
+        writer,
+    )
+}
+
+pub(crate) fn write_with_assets<W: Write + ?Sized>(
+    index: u32,
+    graph: &Graph,
+    linker_graph: &LinkerGraph<'_>,
+    chunks: &[Chunk],
+    assets: &[OutputFile],
+    writer: &mut W,
+) -> Result<(), crate::Error> {
+    let browser_source_index = graph.html_imports.html_source_indices.slice()[index as usize];
+    let server_source_index = graph.html_imports.server_source_indices.slice()[index as usize];
+    let sources: &[Source] = graph.input_files.items_source();
+    // SAFETY: graph points to BundleV2.graph.
+    let bv2: &BundleV2<'_> = unsafe {
+        &*bun_core::from_field_ptr!(BundleV2<'static>, graph, std::ptr::from_ref::<Graph>(graph))
+    };
+    let options = &bv2.transpiler().options;
+    // Same size as the files' entry bits: the linker's list also holds the dynamic imports.
+    let mut entry_point_bits = AutoBitSet::init_empty(linker_graph.entry_points.len())?;
+    let mut chunks_to_write = AutoBitSet::init_empty(chunks.len())?;
+    let mut chunks_to_visit: Vec<u32> = Vec::new();
+
+    let root_dir: &[u8] = if !options.root_dir.is_empty() {
+        &options.root_dir[..]
+    } else {
+        FileSystem::get().top_level_dir()
+    };
+
+    writer.write_all(b"{")?;
+
+    let inject_compiler_filesystem_prefix = options.compile_mode.is_executable();
+    // Use the server-side public path here.
+    let public_path: &[u8] = &options.public_path;
+    let mut temp_buffer: Vec<u8> = Vec::new();
+    let mut input_buffer: Vec<u8> = Vec::new();
+
+    for (chunk_index, ch) in chunks.iter().enumerate() {
+        if ch.entry_point.source_index() == browser_source_index && ch.entry_point.is_entry_point()
+        {
+            entry_point_bits.set(ch.entry_point.entry_point_id() as usize);
+            chunks_to_visit.push(chunk_index as u32);
+
+            if matches!(ch.content, Content::Html) {
+                writer.write_all(b"\"index\":")?;
+                if inject_compiler_filesystem_prefix {
+                    temp_buffer.clear();
+                    temp_buffer.extend_from_slice(public_path);
+                    temp_buffer
+                        .extend_from_slice(strings::remove_leading_dot_slash(&ch.final_rel_path));
+                    bun_js_printer::write_json_string::<_, { Encoding::Utf8 }>(
+                        &temp_buffer,
+                        writer,
+                    )?;
+                } else {
+                    bun_js_printer::write_json_string::<_, { Encoding::Utf8 }>(
+                        &ch.final_rel_path[..],
+                        writer,
+                    )?;
+                }
+                writer.write_all(b",")?;
+            }
+        }
+    }
+
+    // Every chunk the page's chunks import, transitively.
+    while let Some(chunk_index) = chunks_to_visit.pop() {
+        if chunks_to_write.is_set(chunk_index as usize) {
+            continue;
+        }
+        chunks_to_write.set(chunk_index as usize);
+
+        let ch = &chunks[chunk_index as usize];
+        for import in ch.cross_chunk_imports.iter() {
+            let imported = &chunks[import.chunk_index as usize];
+            if imported.entry_point.is_entry_point() {
+                // A dynamic import's entry point: its bit is what the assets only it reaches carry.
+                entry_point_bits.set(imported.entry_point.entry_point_id() as usize);
+            }
+            chunks_to_visit.push(import.chunk_index);
+        }
+        if let Content::Javascript(js) = &ch.content {
+            chunks_to_visit.extend_from_slice(&js.css_chunks);
+        }
+    }
+
+    // Start the files array
+
+    writer.write_all(b"\"files\":[")?;
+
+    let mut first = true;
+
+    let additional_output_files = assets;
+    let file_entry_bits: &[AutoBitSet] = linker_graph.files.items_entry_bits();
+    let mut already_visited_output_file = AutoBitSet::init_empty(additional_output_files.len())?;
+
+    for (chunk_index, ch) in chunks.iter().enumerate() {
+        if chunks_to_write.is_set(chunk_index) {
+            if !first {
+                writer.write_all(b",")?;
+            }
+            first = false;
+
+            let input: &[u8] = if !ch.entry_point.is_entry_point() {
+                b""
+            } else {
+                source_path_relative_to_root(
+                    &mut input_buffer,
+                    root_dir,
+                    sources[ch.entry_point.source_index() as usize].path.text,
+                )
+            };
+
+            let path: &[u8] = if inject_compiler_filesystem_prefix {
+                temp_buffer.clear();
+                temp_buffer.extend_from_slice(public_path);
+                temp_buffer
+                    .extend_from_slice(strings::remove_leading_dot_slash(&ch.final_rel_path));
+                &temp_buffer[..]
+            } else {
+                &ch.final_rel_path
+            };
+
+            write_entry_item(
+                writer,
+                input,
+                path,
+                // The HTML chunk's body embeds the hashed paths of its JS/CSS
+                // chunks, so its etag must change when those do. `isolated_hash`
+                // by design excludes those substitutions; the placeholder hash
+                // folds them in via `appendIsolatedHashesForImportedChunks`.
+                ch.template
+                    .placeholder
+                    .hash
+                    .map_or(ch.isolated_hash, |h| h.value),
+                ch.content.loader(),
+                if ch.entry_point.is_entry_point() {
+                    OutputKind::EntryPoint
+                } else {
+                    OutputKind::Chunk
+                },
+            )?;
+        }
+    }
+
+    for (i, output_file) in additional_output_files.iter().enumerate() {
+        // Only print the file once.
+        if already_visited_output_file.is_set(i) {
+            continue;
+        }
+
+        if let Some(source_index) = output_file.source_index.unwrap() {
+            if source_index.get() == server_source_index {
+                continue;
+            }
+            let bits: &AutoBitSet = &file_entry_bits[source_index.get() as usize];
+
+            if bits.has_intersection(&entry_point_bits) {
+                already_visited_output_file.set(i);
+                if !first {
+                    writer.write_all(b",")?;
+                }
+                first = false;
+
+                let path_for_key = source_path_relative_to_root(
+                    &mut input_buffer,
+                    root_dir,
+                    sources[source_index.get() as usize].path.text,
+                );
+
+                let path: &[u8] = if inject_compiler_filesystem_prefix {
+                    temp_buffer.clear();
+                    temp_buffer.extend_from_slice(public_path);
+                    temp_buffer.extend_from_slice(strings::remove_leading_dot_slash(
+                        &output_file.dest_path,
+                    ));
+                    &temp_buffer[..]
+                } else {
+                    &output_file.dest_path[..]
+                };
+
+                write_entry_item(
+                    writer,
+                    path_for_key,
+                    path,
+                    output_file.hash.value,
+                    output_file.loader,
+                    output_file.output_kind,
+                )?;
+            }
+        }
+    }
+
+    writer.write_all(b"]}")?;
+    Ok(())
+}
+
+pub mod html_import_manifest {
+    use crate::Graph::Graph;
+    use crate::{LinkerGraph, chunk::Chunk};
+
+    pub(crate) fn count_escaped_json(
+        index: u32,
+        graph: &Graph,
+        linker_graph: &LinkerGraph<'_>,
+        chunks: &[Chunk],
+    ) -> usize {
+        let mut counter = bun_io::DiscardingWriter::new();
+        let _ = super::write_escaped_json(index, graph, linker_graph, chunks, &mut counter);
+        counter.count
+    }
+
+    pub(crate) fn write_escaped_json(
+        index: u32,
+        graph: &Graph,
+        linker_graph: &LinkerGraph<'_>,
+        chunks: &[Chunk],
+        w: &mut &mut [u8],
+    ) -> Result<(), core::fmt::Error> {
+        let taken = core::mem::take(w);
+        let mut fbs = bun_io::FixedBufferStream::new_mut(taken);
+        super::write_escaped_json(index, graph, linker_graph, chunks, &mut fbs)
+            .map_err(|_| core::fmt::Error)?;
+        let bun_io::FixedBufferStream { buffer, pos } = fbs;
+        *w = &mut buffer[pos..];
+        Ok(())
+    }
+}
+
+/// The manifest's `input` / asset-key form of a source path: root-relative, `/`-separated.
+fn source_path_relative_to_root<'b>(
+    buf: &'b mut Vec<u8>,
+    root_dir: &[u8],
+    path: &[u8],
+) -> &'b [u8] {
+    buf.clear();
+    buf.extend_from_slice(strings::remove_leading_dot_slash(relative_normalized::<
+        platform::Auto,
+        false,
+    >(root_dir, path)));
+    platform_to_posix_in_place(&mut buf[..]);
+    buf
+}

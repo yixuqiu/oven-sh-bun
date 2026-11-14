@@ -1,7 +1,7 @@
 import assert from "assert";
-import { describe, test, expect } from "bun:test";
-import def from "util/types";
-import * as ns from "util/types";
+import { expect, test } from "bun:test";
+import def, * as ns from "util/types";
+import vm from "vm";
 const req = require("util/types");
 const types = def;
 
@@ -48,6 +48,7 @@ for (const [value, _method] of [
   [new DataView(new ArrayBuffer())],
   [new SharedArrayBuffer()],
   [new Proxy({}, {}), "isProxy"],
+  [new EventTarget()],
 ]) {
   const method = _method || `is${value.constructor.name}`;
   test(method, () => {
@@ -73,11 +74,70 @@ for (const [value, _method] of [
   });
 }
 
+test("isProxy is false for a global object", () => {
+  expect({
+    globalThis: types.isProxy(globalThis),
+    contextified: types.isProxy(vm.runInNewContext("this")),
+    notContextified: types.isProxy(vm.createContext(vm.constants.DONT_CONTEXTIFY)),
+    proxyOfGlobalThis: types.isProxy(new Proxy(globalThis, {})),
+  }).toEqual({
+    globalThis: false,
+    contextified: false,
+    notContextified: false,
+    proxyOfGlobalThis: true,
+  });
+});
+
 // Check boxed primitives.
 test("isBoxedPrimitive", () => {
   [new Boolean(), new Number(), new String(), Object(Symbol()), Object(BigInt(0))].forEach(entry =>
     assert(types.isBoxedPrimitive(entry)),
   );
+});
+
+test("isBigIntObject/isSymbolObject/isBoxedPrimitive survive structure and prototype changes", () => {
+  const cases = [
+    ["isBigIntObject", () => Object(1n)],
+    ["isSymbolObject", () => Object(Symbol())],
+  ];
+  for (const [method, make] of cases) {
+    const withProp = make();
+    withProp.foo = "bar";
+    const nullProto = Object.setPrototypeOf(make(), null);
+    const arrayProto = Object.setPrototypeOf(make(), Array.prototype);
+
+    expect({
+      [method]: {
+        plain: types[method](make()),
+        withProp: types[method](withProp),
+        nullProto: types[method](nullProto),
+        arrayProto: types[method](arrayProto),
+        primitive: types[method](make().valueOf()),
+        plainObject: types[method]({}),
+      },
+      isBoxedPrimitive: {
+        plain: types.isBoxedPrimitive(make()),
+        withProp: types.isBoxedPrimitive(withProp),
+        nullProto: types.isBoxedPrimitive(nullProto),
+        arrayProto: types.isBoxedPrimitive(arrayProto),
+      },
+    }).toEqual({
+      [method]: {
+        plain: true,
+        withProp: true,
+        nullProto: true,
+        arrayProto: true,
+        primitive: false,
+        plainObject: false,
+      },
+      isBoxedPrimitive: {
+        plain: true,
+        withProp: true,
+        nullProto: true,
+        arrayProto: true,
+      },
+    });
+  }
 });
 
 {
@@ -253,7 +313,14 @@ test("isAsyncFunction", () => {
     expect(types.isAsyncFunction(fn)).toBeTrue();
   }
 
-  for (let fn of [function normal() {}, function* generatorFn() {}]) {
+  for (let fn of [
+    function normal() {},
+    function* generatorFn() {},
+    function bound() {}.bind(),
+    Bun.sleep, // host function
+    Promise.resolve, // builtin function
+    async function asyncBound() {}.bind(), // node also returns false
+  ]) {
     expect(types.isAsyncFunction(fn)).toBeFalse();
   }
 });
@@ -262,7 +329,15 @@ test("isGeneratorFunction", () => {
     expect(types.isGeneratorFunction(fn)).toBeTrue();
   }
 
-  for (let fn of [function normal() {}, async function asyncFn() {}]) {
+  for (let fn of [
+    function normal() {},
+    async function asyncFn() {},
+    function bound() {}.bind(),
+    Bun.sleep, // host function
+    Promise.resolve, // builtin function
+    function* boundGenerator() {}.bind(), // node also returns false
+    async function* boundAsyncGenerator() {}.bind(), // node also returns false
+  ]) {
     expect(types.isGeneratorFunction(fn)).toBeFalse();
   }
 });
@@ -276,4 +351,39 @@ test("isKeyObject", () => {
   expect(types.isKeyObject({})).toBeFalse();
   expect(types.isKeyObject(null)).toBeFalse();
   expect(types.isKeyObject(undefined)).toBeFalse();
+});
+
+test("#11780", () => {
+  let resolveError;
+  try {
+    resolveError = require("OOGA_BOOGA");
+  } catch (e) {
+    resolveError = e;
+  }
+  expect(resolveError.constructor.name).toBe("ResolveMessage");
+  expect(types.isNativeError(resolveError)).toBeTrue();
+
+  const badCode = `
+export default /BADD~!!!!;
+
+  `;
+  const blob = new Blob([badCode], { type: "application/javascript" });
+  const url = URL.createObjectURL(blob);
+  let buildError;
+  try {
+    require(url);
+  } catch (e) {
+    buildError = e;
+  }
+  expect(types.isNativeError(buildError)).toBeTrue();
+  expect(buildError.constructor.name).toBe("BuildMessage");
+});
+
+test("util/types functions aren't constructors", () => {
+  for (const [name, fn] of Object.entries(types)) {
+    if (typeof fn !== "function") continue;
+    expect(() => Reflect.construct(fn, [new Date()])).toThrow(TypeError);
+    expect(Bun.inspect(fn)).toBe(`[Function: ${name}]`);
+  }
+  expect(Array.of.call(types.isDate, 1, 2, 3)).toEqual([1, 2, 3]);
 });

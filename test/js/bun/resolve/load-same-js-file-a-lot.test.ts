@@ -1,7 +1,10 @@
-import { test, expect } from "bun:test";
-import { withoutAggressiveGC } from "harness";
+import { expect, test } from "bun:test";
+import { isASAN, isDebug } from "harness";
 
-test("load the same file 10,000 times", async () => {
+const slowBuildMultiplier = isDebug ? 0.02 : isASAN ? 0.2 : 1;
+const count = Math.floor(10000 * slowBuildMultiplier);
+
+test(`load the same file ${count} times`, async () => {
   const meta = {
     url: import.meta.url.toLocaleLowerCase().replace(".test.ts", ".js"),
     dir: import.meta.dir.toLocaleLowerCase().replace(".test.ts", ".js"),
@@ -12,7 +15,7 @@ test("load the same file 10,000 times", async () => {
   };
   const prev = Bun.unsafe.gcAggressionLevel();
   Bun.unsafe.gcAggressionLevel(0);
-  for (let i = 0; i < 10000; i++) {
+  for (let i = 0; i < count; i++) {
     const {
       default: { url, dir, file, path, dirname, filename },
     } = await import("./load-same-js-file-a-lot.js?i=" + i);
@@ -27,10 +30,10 @@ test("load the same file 10,000 times", async () => {
   Bun.unsafe.gcAggressionLevel(prev);
 });
 
-test("load the same empty JS file 10,000 times", async () => {
+test(`load the same empty JS file ${count} times`, async () => {
   const prev = Bun.unsafe.gcAggressionLevel();
   Bun.unsafe.gcAggressionLevel(0);
-  for (let i = 0; i < 10000; i++) {
+  for (let i = 0; i < count; i++) {
     const { default: obj } = await import("./load-same-empty-js-file-a-lot.js?i=" + i);
     expect(obj).toEqual({});
   }

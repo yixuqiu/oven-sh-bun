@@ -1,18 +1,16 @@
 import { spawn } from "bun";
 import { expect, test } from "bun:test";
-import { closeSync, openSync } from "fs";
-import { bunEnv, bunExe, dumpStats, expectMaxObjectTypeCount } from "harness";
-import { devNull } from "node:os";
+import { bunEnv, bunExe, dumpStats, expectMaxObjectTypeCount, getMaxFD, isASAN } from "harness";
 import { join } from "path";
 
-const N = 100;
+const N = 50;
 const concurrency = 16;
-const delay = 8 * 12;
+const delay = isASAN ? 500 : 150;
 
 test("spawn can write to stdin multiple chunks", async () => {
   const interval = setInterval(dumpStats, 1000).unref();
 
-  const maxFD = openSync(devNull, "w");
+  const maxFD = getMaxFD();
 
   var remaining = N;
   while (remaining > 0) {
@@ -65,9 +63,13 @@ test("spawn can write to stdin multiple chunks", async () => {
     remaining -= concurrency;
   }
 
-  closeSync(maxFD);
-  const newMaxFD = openSync(devNull, "w");
-  closeSync(newMaxFD);
+  // Pipe fds are closed on a background thread after their streams finish, so
+  // the last batch's closes may still be in flight here; wait for them to land.
+  let newMaxFD = getMaxFD();
+  for (let i = 0; i < 100 && newMaxFD !== maxFD; i++) {
+    await Bun.sleep(10);
+    newMaxFD = getMaxFD();
+  }
 
   // assert we didn't leak any file descriptors
   expect(newMaxFD).toBe(maxFD);

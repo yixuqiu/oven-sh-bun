@@ -1,5 +1,4 @@
 import { AsyncLocalStorage } from "async_hooks";
-import { hideFromStackTrace } from "harness";
 import { createTest } from "node-harness";
 const store = new AsyncLocalStorage();
 const data = Symbol("verifier");
@@ -9,16 +8,16 @@ const { beforeAll, describe, expect, it, throws, assert, createCallCheckCtx, cre
 );
 
 test("node.js test test-async-local-storage-no-mix-contexts.js", async () => {
-  const asyncLocalStorage = new AsyncLocalStorage();
+  const asyncLocalStorage = new AsyncLocalStorage<Map<string, number>>();
   const err = new Error();
   const next = () =>
     Promise.resolve().then(() => {
-      assert.strictEqual(asyncLocalStorage.getStore().get("a"), 1);
+      assert.strictEqual(asyncLocalStorage.getStore()!.get("a"), 1);
       throw err;
     });
   await new Promise((resolve, reject) => {
     asyncLocalStorage.run(new Map(), () => {
-      const store = asyncLocalStorage.getStore();
+      const store = asyncLocalStorage.getStore()!;
       store.set("a", 1);
       next().then(resolve, reject);
     });

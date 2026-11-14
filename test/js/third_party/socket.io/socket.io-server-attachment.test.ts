@@ -1,8 +1,8 @@
-import { Server } from "socket.io";
+import { describe, expect, it } from "bun:test";
 import { createServer } from "http";
+import { Server } from "socket.io";
 import request from "supertest";
-import { getPort, success, fail } from "./support/util";
-import { describe, it, expect } from "bun:test";
+import { fail, getPort, success } from "./support/util";
 
 // Hanging tests are disabled because they cause the test suite to hang
 describe.skip("server attachment", () => {
@@ -25,7 +25,7 @@ describe.skip("server attachment", () => {
           try {
             expect(res.headers["content-type"]).toBe("application/javascript; charset=utf-8");
             expect(res.headers.etag).toBe('"' + clientVersion + '"');
-            expect(res.headers["x-sourcemap"]).toBe(undefined);
+            expect(res.headers["x-sourcemap"] as string | undefined).toBe(undefined);
             expect(res.text).toMatch(/engine\.io/);
             expect(res.status).toBe(200);
             success(done, io);

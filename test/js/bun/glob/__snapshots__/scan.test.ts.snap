@@ -1,4 +1,4 @@
-// Bun Snapshot v1, https://goo.gl/fbAQLP
+// Bun Snapshot v1, https://bun.sh/docs/test/snapshots
 
 exports[`fast-glob e2e tests patterns regular fixtures/*: fixtures/* 1`] = `
 [
@@ -394,6 +394,8 @@ exports[`fast-glob e2e tests patterns regular relative cwd ./*: ./* 1`] = `
 [
   "./leak.test.ts",
   "./match.test.ts",
+  "./path-length.test.ts",
+  "./proto.test.ts",
   "./scan.test.ts",
   "./stress.test.ts",
   "./util.ts",
@@ -972,7 +974,7 @@ exports[`fast-glob e2e tests (absolute) patterns absolute cwd *: absolute: * 1`]
 
 exports[`fast-glob e2e tests patterns absolute cwd *: absolute: * 1`] = `
 [
-  "",
+  "file.md",
 ]
 `;
 
@@ -993,16 +995,16 @@ exports[`fast-glob e2e tests (absolute) patterns absolute cwd **: absolute: ** 1
 
 exports[`fast-glob e2e tests patterns absolute cwd **: absolute: ** 1`] = `
 [
-  "",
-  "",
-  "",
-  "",
-  "",
-  "",
-  "",
-  "",
-  "",
-  "",
+  "file.md",
+  "first/file.md",
+  "first/nested/directory/file.json",
+  "first/nested/directory/file.md",
+  "first/nested/file.md",
+  "second/file.md",
+  "second/nested/directory/file.md",
+  "second/nested/file.md",
+  "third/library/a/book.md",
+  "third/library/b/book.md",
 ]
 `;
 
@@ -1023,16 +1025,16 @@ exports[`fast-glob e2e tests (absolute) patterns absolute cwd **/*: absolute: **
 
 exports[`fast-glob e2e tests patterns absolute cwd **/*: absolute: **/* 1`] = `
 [
-  "",
-  "",
-  "",
-  "",
-  "",
-  "",
-  "",
-  "",
-  "",
-  "",
+  "file.md",
+  "first/file.md",
+  "first/nested/directory/file.json",
+  "first/nested/directory/file.md",
+  "first/nested/file.md",
+  "second/file.md",
+  "second/nested/directory/file.md",
+  "second/nested/file.md",
+  "third/library/a/book.md",
+  "third/library/b/book.md",
 ]
 `;
 
@@ -1103,3 +1105,7 @@ exports[`fast-glob e2e tests (absolute) only files (cwd) **/*: absolute: **/* 1`
   "/fixtures/third/library/b/book.md",
 ]
 `;
+
+exports[`fast-glob e2e tests (absolute) patterns regular ../.: absolute: ../. 1`] = `[]`;
+
+exports[`fast-glob e2e tests patterns regular ../.: ../. 1`] = `[]`;

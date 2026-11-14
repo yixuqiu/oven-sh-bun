@@ -1,27 +1,16 @@
-import React from "react";
-import { useContext, createContext } from "react";
-import { render, unmountComponentAtNode } from "react-dom";
-import type {
-  FallbackMessageContainer,
-  JSException,
-  JSException as JSExceptionType,
-  Location,
-  Message,
-  SourceLine,
-  StackFrame,
-  WebsocketMessageBuildFailure,
-} from "../../src/api/schema";
-import { messagesToMarkdown, problemsToMarkdown, withBunInfo } from "./markdown";
-import { fetchAllMappings, remapPosition, sourceMappings } from "./sourcemap";
-
-export enum StackFrameScope {
-  Eval = 1,
-  Module = 2,
-  Function = 3,
-  Global = 4,
-  Wasm = 5,
-  Constructor = 6,
-}
+import type { JSX } from "preact";
+import { createContext, render } from "preact";
+import { useCallback, useContext, useEffect, useRef, useState } from "preact/hooks";
+import { problemsToMarkdown, withBunInfo } from "./markdown";
+import {
+  StackFrameScope,
+  type FallbackMessageContainer,
+  type JSException as JSExceptionType,
+  type Location,
+  type Message,
+  type SourceLine,
+  type StackFrame,
+} from "./schema";
 
 export enum JSErrorCode {
   Error = 0,
@@ -165,17 +154,17 @@ const maybeBlobFileURL = (filename: string, line?: number, column?: number): str
   return srcFileURL(filename, line, column);
 };
 
-const openWithoutFlashOfNewTab: React.MouseEventHandler<HTMLAnchorElement> = event => {
-  const target = event.currentTarget;
+const openWithoutFlashOfNewTab: JSX.MouseEventHandler<HTMLAnchorElement> = event => {
+  const target = event.currentTarget as HTMLAnchorElement;
   const href = target.getAttribute("href");
   if (!href || event.button !== 0) {
     return true;
   }
 
   event.preventDefault();
-  event.nativeEvent.preventDefault();
-  event.nativeEvent.stopPropagation();
-  event.nativeEvent.stopImmediatePropagation();
+  event.preventDefault();
+  event.stopPropagation();
+  event.stopImmediatePropagation();
 
   const headers = new Headers();
   headers.set("Accept", "text/plain");
@@ -225,7 +214,7 @@ const srcFileURL = (filename: string, line?: number, column?: number): string =>
 };
 
 class FancyTypeError {
-  constructor(exception: JSException) {
+  constructor(exception: JSExceptionType) {
     this.runtimeType = exception.runtime_type || 0;
     this.runtimeTypeName = RuntimeType[this.runtimeType] || "undefined";
     this.message = exception.message || "";
@@ -239,7 +228,7 @@ class FancyTypeError {
   runtimeTypeName: string;
   message: string;
 
-  normalize(exception: JSException) {
+  normalize(exception: JSExceptionType) {
     if (!exception.message) return;
     const i = exception.message.lastIndexOf(" is ");
     if (i === -1) return;
@@ -317,18 +306,18 @@ const AsyncSourceLines = ({
 }: {
   highlight: number;
   highlightColumnStart: number;
-  highlightColumnEnd: number;
-  children?: React.ReactNode;
+  highlightColumnEnd?: number;
+  children?: any;
   buildURL: (line?: number, column?: number) => string;
   sourceLines: SourceLine[];
   setSourceLines: (lines: SourceLine[]) => void;
 }) => {
-  const [loadState, setLoadState] = React.useState(LoadState.pending);
+  const [loadState, setLoadState] = useState(LoadState.pending);
 
-  const controller = React.useRef<AbortController | null>(null);
-  const url = React.useRef<string>(buildURL(0, 0));
+  const controller = useRef<AbortController | null>(null);
+  const url = useRef<string>(buildURL(0, 0));
 
-  React.useEffect(() => {
+  useEffect(() => {
     controller.current = new AbortController();
     var cancelled = false;
     fetch(url.current, {
@@ -432,8 +421,8 @@ const SourceLines = ({
   sourceLines: SourceLine[];
   highlight: number;
   highlightColumnStart: number;
-  highlightColumnEnd: number;
-  children?: React.ReactNode;
+  highlightColumnEnd?: number;
+  children?: any;
   buildURL: (line?: number, column?: number) => string;
 }) => {
   let start = sourceLines.length;
@@ -462,7 +451,7 @@ const SourceLines = ({
   const leftPad = maxLineNumber.toString(10).length - minLineNumber.toString(10).length;
 
   const _sourceLines = sourceLines.slice(start, end);
-  const lines = new Array(_sourceLines.length + React.Children.count(children));
+  const lines = new Array(_sourceLines.length + (Array.isArray(children) ? children.length : children ? 1 : 0));
 
   let highlightI = 0;
   for (let i = 0; i < _sourceLines.length; i++) {
@@ -511,16 +500,10 @@ const SourceLines = ({
   );
 };
 
-const BuildErrorSourceLines = ({
-  location,
-  filename,
-}: {
-  location: Location;
-  filename: string;
-}) => {
+const BuildErrorSourceLines = ({ location, filename }: { location: Location; filename: string }) => {
   const { line, line_text, column } = location;
   const sourceLines: SourceLine[] = [{ line, text: line_text }];
-  const buildURL = React.useCallback((line, column) => srcFileURL(filename, line, column), [srcFileURL, filename]);
+  const buildURL = useCallback((line, column) => srcFileURL(filename, line, column), [filename]);
   return (
     <SourceLines
       sourceLines={sourceLines}
@@ -612,7 +595,7 @@ const NativeStackFrame = ({
   const {
     file,
     function_name: functionName,
-    position: { line, column_start: column },
+    position: { line, column },
     scope,
   } = frame;
   const fileName = normalizedFilename(file, cwd);
@@ -621,7 +604,6 @@ const NativeStackFrame = ({
       <div
         title={StackFrameScope[scope]}
         className="BunError-StackFrame-identifier"
-        // @ts-expect-error Custom CSS variables are not known by TypeScript
         style={{ "--max-length": `${maxLength}ch` }}
       >
         {getNativeStackFrameIdentifier(frame)}
@@ -676,34 +658,34 @@ const NativeStackTrace = ({
   frames: StackFrame[];
   sourceLines: SourceLine[];
   setSourceLines: (sourceLines: SourceLine[]) => void;
-  children?: React.ReactNode;
+  children?: any;
   isClient: boolean;
 }) => {
   const { file = "", position } = frames[0];
   const { cwd } = useContext(ErrorGroupContext);
   const filename = normalizedFilename(file, cwd);
   const urlBuilder = isClient ? clientURL : maybeBlobFileURL;
-  const ref = React.useRef<HTMLDivElement>(null);
-  const buildURL = React.useCallback((line, column) => urlBuilder(file, line, column), [file, urlBuilder]);
+  const ref = useRef<HTMLDivElement>(null);
+  const buildURL = useCallback((line, column) => urlBuilder(file, line, column), [file, urlBuilder]);
 
   return (
     <div ref={ref} className={`BunError-NativeStackTrace`}>
       <a
-        href={urlBuilder(filename, position.line, position.column_start)}
+        href={urlBuilder(filename, position.line, position.column)}
         data-line={position.line}
-        data-column={position.column_start}
+        data-column={position.column}
         data-is-client="true"
         target="_blank"
         onClick={openWithoutFlashOfNewTab}
         className="BunError-NativeStackTrace-filename"
       >
-        {filename}:{position.line}:{position.column_start}
+        {filename}:{position.line}:{position.column}
       </a>
       {sourceLines.length > 0 && (
         <SourceLines
           highlight={position.line}
           sourceLines={sourceLines}
-          highlightColumnStart={position.column_start}
+          highlightColumnStart={position.column}
           buildURL={buildURL}
           highlightColumnEnd={position.column_stop}
         >
@@ -715,7 +697,7 @@ const NativeStackTrace = ({
           highlight={position.line}
           sourceLines={sourceLines}
           setSourceLines={setSourceLines}
-          highlightColumnStart={position.column_start}
+          highlightColumnStart={position.column}
           buildURL={buildURL}
           highlightColumnEnd={position.column_stop}
         >
@@ -737,15 +719,9 @@ const Indent = ({ by, children }) => {
   );
 };
 
-const JSException = ({
-  value,
-  isClient = false,
-}: {
-  value: JSExceptionType;
-  isClient: boolean;
-}) => {
+const JSException = ({ value, isClient = false }: { value: JSExceptionType; isClient: boolean }) => {
   const tag = isClient ? ErrorTagType.client : ErrorTagType.server;
-  const [sourceLines, _setSourceLines] = React.useState(value?.stack?.source_lines ?? []);
+  const [sourceLines, _setSourceLines] = useState(value?.stack?.source_lines ?? []);
   var message = value.message || "";
   var name = value.name || "";
   if (!name && !message) {
@@ -791,7 +767,7 @@ const JSException = ({
                 sourceLines={sourceLines}
                 setSourceLines={setSourceLines}
               >
-                <Indent by={value.stack.frames[0].position.column_start}>
+                <Indent by={value.stack.frames[0].position.column}>
                   <span className="BunError-error-typename">{fancyTypeError.runtimeTypeName}</span>
                 </Indent>
               </NativeStackTrace>
@@ -853,13 +829,7 @@ const JSException = ({
   }
 };
 
-const Summary = ({
-  errorCount,
-  onClose,
-}: {
-  errorCount: number;
-  onClose: () => void;
-}) => {
+const Summary = ({ errorCount, onClose }: { errorCount: number; onClose: () => void }) => {
   return (
     <div className="BunError-Summary">
       <div className="BunError-Summary-ErrorIcon"></div>
@@ -867,9 +837,9 @@ const Summary = ({
         {errorCount}&nbsp;error{errorCount > 1 ? "s" : ""}&nbsp;on this page
       </div>
 
-      <a href="https://bun.sh/discord" target="_blank" className="BunError-Summary-help">
+      <a href="https://bun.com/discord" target="_blank" className="BunError-Summary-help">
         <svg width="18" viewBox="0 0 71 55" fill="none" xmlns="http://www.w3.org/2000/svg">
-          <g clip-path="url(#clip0)">
+          <g clipPath="url(#clip0)">
             <path
               d="M60.1045 4.8978C55.5792 2.8214 50.7265 1.2916 45.6527 0.41542C45.5603 0.39851 45.468 0.440769 45.4204 0.525289C44.7963 1.6353 44.105 3.0834 43.6209 4.2216C38.1637 3.4046 32.7345 3.4046 27.3892 4.2216C26.905 3.0581 26.1886 1.6353 25.5617 0.525289C25.5141 0.443589 25.4218 0.40133 25.3294 0.41542C20.2584 1.2888 15.4057 2.8186 10.8776 4.8978C10.8384 4.9147 10.8048 4.9429 10.7825 4.9795C1.57795 18.7309 -0.943561 32.1443 0.293408 45.3914C0.299005 45.4562 0.335386 45.5182 0.385761 45.5576C6.45866 50.0174 12.3413 52.7249 18.1147 54.5195C18.2071 54.5477 18.305 54.5139 18.3638 54.4378C19.7295 52.5728 20.9469 50.6063 21.9907 48.5383C22.0523 48.4172 21.9935 48.2735 21.8676 48.2256C19.9366 47.4931 18.0979 46.6 16.3292 45.5858C16.1893 45.5041 16.1781 45.304 16.3068 45.2082C16.679 44.9293 17.0513 44.6391 17.4067 44.3461C17.471 44.2926 17.5606 44.2813 17.6362 44.3151C29.2558 49.6202 41.8354 49.6202 53.3179 44.3151C53.3935 44.2785 53.4831 44.2898 53.5502 44.3433C53.9057 44.6363 54.2779 44.9293 54.6529 45.2082C54.7816 45.304 54.7732 45.5041 54.6333 45.5858C52.8646 46.6197 51.0259 47.4931 49.0921 48.2228C48.9662 48.2707 48.9102 48.4172 48.9718 48.5383C50.038 50.6034 51.2554 52.5699 52.5959 54.435C52.6519 54.5139 52.7526 54.5477 52.845 54.5195C58.6464 52.7249 64.529 50.0174 70.6019 45.5576C70.6551 45.5182 70.6887 45.459 70.6943 45.3942C72.1747 30.0791 68.2147 16.7757 60.1968 4.9823C60.1772 4.9429 60.1437 4.9147 60.1045 4.8978ZM23.7259 37.3253C20.2276 37.3253 17.3451 34.1136 17.3451 30.1693C17.3451 26.225 20.1717 23.0133 23.7259 23.0133C27.308 23.0133 30.1626 26.2532 30.1066 30.1693C30.1066 34.1136 27.28 37.3253 23.7259 37.3253ZM47.3178 37.3253C43.8196 37.3253 40.9371 34.1136 40.9371 30.1693C40.9371 26.225 43.7636 23.0133 47.3178 23.0133C50.9 23.0133 53.7545 26.2532 53.6986 30.1693C53.6986 34.1136 50.9 37.3253 47.3178 37.3253Z"
               fill="#5865F2"
@@ -941,11 +911,7 @@ const ResolveError = ({ message }: { message: Message }) => {
     </div>
   );
 };
-const OverlayMessageContainer = ({
-  problems,
-  reason,
-  isClient = false,
-}: FallbackMessageContainer & { isClient: boolean }) => {
+const OverlayMessageContainer = ({ problems, isClient = false }: FallbackMessageContainer & { isClient: boolean }) => {
   const errorCount = problems ? problems.exceptions.length + problems.build.errors : 0;
   return (
     <div id="BunErrorOverlay-container">
@@ -1001,33 +967,6 @@ const Footer = ({ toMarkdown, data }) => (
   </div>
 );
 
-const BuildFailureMessageContainer = ({
-  messages,
-}: {
-  messages: Message[];
-}) => {
-  return (
-    <div id="BunErrorOverlay-container">
-      <div className="BunError-content">
-        <div className="BunError-header">
-          <Summary onClose={dismissError} errorCount={messages.length} />
-        </div>
-        <div className={`BunError-list`}>
-          {messages.map((buildMessage, index) => {
-            if (buildMessage.on.build) {
-              return <BuildError key={index} message={buildMessage} />;
-            } else if (buildMessage.on.resolve) {
-              return <ResolveError key={index} message={buildMessage} />;
-            } else {
-              throw new Error("Unknown build message type");
-            }
-          })}
-        </div>
-        <Footer toMarkdown={messagesToMarkdown} data={messages} />
-      </div>
-    </div>
-  );
-};
 export var thisCwd = "";
 const ErrorGroupContext = createContext<{ cwd?: string }>({ cwd: undefined });
 var reactRoot;
@@ -1057,12 +996,6 @@ function renderWithFunc(func) {
       fallbackStyleSheet.remove();
       shadowRoot.appendChild(fallbackStyleSheet);
       reactRoot.classList.add("BunErrorRoot--FullPage");
-
-      const page = document.querySelector("style[data-bun-error-page-style]");
-      if (page) {
-        page.remove();
-        shadowRoot.appendChild(page);
-      }
     }
 
     shadowRoot.appendChild(reactRoot);
@@ -1078,9 +1011,6 @@ export function renderFallbackError(fallback: FallbackMessageContainer) {
   if (fallback && fallback.cwd) {
     thisCwd = fallback.cwd;
   }
-  // Not an error
-  if (fallback?.problems?.name === "JSDisabled") return;
-
   return renderWithFunc(() => (
     <ErrorGroupContext.Provider value={fallback}>
       <OverlayMessageContainer isClient {...fallback} />
@@ -1090,202 +1020,11 @@ export function renderFallbackError(fallback: FallbackMessageContainer) {
 
 globalThis[Symbol.for("Bun__renderFallbackError")] = renderFallbackError;
 
-import { parse as getStackTrace } from "./stack-trace-parser";
-var runtimeErrorController: AbortController | null = null;
-var pending: { stopped: boolean }[] = [];
-
-var onIdle = globalThis.requestIdleCallback || (cb => setTimeout(cb, 32));
-function clearSourceMappings() {
-  sourceMappings.clear();
-}
-export function renderRuntimeError(error: Error) {
-  runtimeErrorController = new AbortController();
-  if (typeof error === "string") {
-    error = {
-      name: "Error",
-      message: error,
-    };
-  }
-
-  const exception = {
-    name: String(error.name),
-    message: String(error.message),
-    runtime_type: 0,
-    stack: {
-      frames: error.stack ? getStackTrace(error.stack) : [],
-      source_lines: [],
-    },
-  };
-
-  var lineNumberProperty = "";
-  var columnNumberProperty = "";
-  var fileNameProperty = "";
-
-  if (error && typeof error === "object") {
-    // safari
-    if ("line" in error) {
-      lineNumberProperty = "line";
-      // firefox
-    } else if ("lineNumber" in error) {
-      lineNumberProperty = "lineNumber";
-    }
-
-    // safari
-    if ("column" in error) {
-      columnNumberProperty = "column";
-      // firefox
-    } else if ("columnNumber" in error) {
-      columnNumberProperty = "columnNumber";
-    }
-
-    // safari
-    if ("sourceURL" in error) {
-      fileNameProperty = "sourceURL";
-      // firefox
-    } else if ("fileName" in error) {
-      fileNameProperty = "fileName";
-    }
-  }
-
-  if (Number.isFinite(error[lineNumberProperty])) {
-    if (exception.stack?.frames.length == 0) {
-      exception.stack.frames.push({
-        file: error[fileNameProperty] || "",
-        position: {
-          line: +error[lineNumberProperty] || 1,
-          column_start: +error[columnNumberProperty] || 1,
-        },
-      } as StackFrame);
-    } else if (exception.stack && exception.stack.frames.length > 0) {
-      exception.stack.frames[0].position.line = error[lineNumberProperty];
-
-      if (Number.isFinite(error[columnNumberProperty])) {
-        exception.stack.frames[0].position.column_start = error[columnNumberProperty];
-      }
-    }
-  }
-  const signal = runtimeErrorController.signal;
-
-  const fallback: FallbackMessageContainer = {
-    message: error.message,
-
-    problems: {
-      build: {
-        warnings: 0,
-        errors: 0,
-        msgs: [],
-      },
-      code: 0,
-      name: error.name,
-      exceptions: [exception],
-    },
-  };
-
-  var stopThis = { stopped: false };
-  pending.push(stopThis);
-
-  const BunError = () => {
-    return (
-      <ErrorGroupContext.Provider value={fallback}>
-        <OverlayMessageContainer isClient {...fallback} />
-      </ErrorGroupContext.Provider>
-    );
-  };
-
-  // Remap the sourcemaps
-  // But! If we've already fetched the source mappings in this page load before
-  // Rely on the cached ones
-  // and don't fetch them again
-  const framePromises = fetchAllMappings(
-    exception.stack.frames.map(frame => normalizedFilename(frame.file, thisCwd)),
-    signal,
-  )
-    .map((frame, i) => {
-      if (stopThis.stopped) return null;
-      return [frame, i];
-    })
-    .map(result => {
-      if (!result) return;
-      const [mappings, frameIndex] = result;
-      if (mappings?.then) {
-        return mappings.then(mappings => {
-          if (!mappings || stopThis.stopped) {
-            return null;
-          }
-          var frame = exception.stack.frames[frameIndex];
-
-          const { line, column_start } = frame.position;
-          const remapped = remapPosition(mappings, line, column_start);
-          if (!remapped) return null;
-          frame.position.line_start = frame.position.line = remapped[0];
-          frame.position.column_stop =
-            frame.position.expression_stop =
-            frame.position.expression_start =
-            frame.position.column_start =
-              remapped[1];
-        }, console.error);
-      } else {
-        if (!mappings) return null;
-        var frame = exception.stack.frames[frameIndex];
-        const { line, column_start } = frame.position;
-        const remapped = remapPosition(mappings, line, column_start);
-        if (!remapped) return null;
-        frame.position.line_start = frame.position.line = remapped[0];
-        frame.position.column_stop =
-          frame.position.expression_stop =
-          frame.position.expression_start =
-          frame.position.column_start =
-            remapped[1];
-      }
-    });
-
-  var anyPromises = false;
-  for (let i = 0; i < framePromises.length; i++) {
-    if (framePromises[i] && framePromises[i].then) {
-      anyPromises = true;
-      break;
-    }
-  }
-
-  if (anyPromises) {
-    Promise.allSettled(framePromises).finally(() => {
-      if (stopThis.stopped || signal.aborted) return;
-      onIdle(clearSourceMappings);
-      return renderWithFunc(() => {
-        return <BunError />;
-      });
-    });
-  } else {
-    onIdle(clearSourceMappings);
-    renderWithFunc(() => {
-      return <BunError />;
-    });
-  }
-}
-
 export function dismissError() {
   if (reactRoot) {
-    unmountComponentAtNode(reactRoot);
+    render(null, reactRoot);
     const root = document.getElementById("__bun__error-root");
     if (root) root.remove();
     reactRoot = null;
-    if (runtimeErrorController) {
-      runtimeErrorController.abort();
-      runtimeErrorController = null;
-    }
-
-    while (pending.length > 0) pending.shift().stopped = true;
   }
 }
-
-export const renderBuildFailure = (failure: WebsocketMessageBuildFailure, cwd: string) => {
-  thisCwd = cwd;
-  renderWithFunc(() => (
-    <ErrorGroupContext.Provider value={{ cwd }}>
-      <BuildFailureMessageContainer messages={failure.log.msgs} />
-    </ErrorGroupContext.Provider>
-  ));
-};
-
-export const clearBuildFailure = dismissError;
-globalThis.__BunClearBuildFailure = dismissError;
